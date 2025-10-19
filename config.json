@@ -1,0 +1,80 @@
+{
+  "project": {
+    "name": "RAPTOR",
+    "mode": "production"
+  },
+  "datasets": "COCO, LVIS, OPENIMAGES, CUSTOM",
+  "paths": {
+    "root": "datasets/mixture",
+    "log_file": "logs/raptor.log",
+    "model_dir": "runs/dinov3_rtdetr",
+    "ablation_dir": "runs/ablation",
+  },
+  "workflow": {
+    "download_data": "Download data automatically from the internet if not present locally.",
+    "merge_data": "Convert and Merge datasets into COCO format.",
+    "train": "Train the model",
+    "test": "Inference and evaluation on validation set",
+    "zero_shot": "Zero-shot evaluation on custom images",
+    "production": "Holistic Detection for Production",
+    "ablation": "Run ablation studies with different configurations."
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s",
+    "rotate_max_bytes": 10485760,
+    "rotate_backups": 5
+  },
+  "train": {
+    "batch_size": 2,
+    "val_batch_size": 2,
+    "accum_steps": 4,
+    "epochs": 50,
+    "logging_steps": 50,
+    "lr_scheduler_type": "cosine",
+    "learning_rate": 0.0002,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.05,
+    "image_short": 640,
+    "image_long": 640
+  },
+  "loss": {
+    "use_focal": true,
+    "focal_alpha": 0.25,
+    "focal_gamma": 2.0,
+    "vfl_weight": 1.0,
+    "eos_coefficient": 0.00005
+  },
+  "open_vocab": {
+    "text_encoder": "google/siglip-so400m-patch14-384",
+    "lexicon_path": "resources/open_vocab_lexicon.txt",
+    "open_score_thresh": 0.28
+  },
+  "hf": {
+    "key": "ADD_YOUR_OWN_KEY",
+    "model_name": "facebook/dinov3-base",
+    "cache_dir": "cache/huggingface"
+  },
+  "accelerate": {
+    "enabled": true,
+    "mixed_precision": "fp16",
+    "cpu": false,
+    "num_processes": 4,
+    "USE_TORCH_DISTRIBUTED": true,
+    "USE_TORCH_DISTRIBUTED_DEBUG": false,
+    "USE_TORCH_DISTRIBUTED_INIT_METHOD": "env://",
+    "USE_TORCH_DISTRIBUTED_BACKEND": "nccl",
+    "USE_TORCH_DISTRIBUTED_PORT": "29500",
+    "USE_TORCH_DISTRIBUTED_WORLD_SIZE": 1,
+    "USE_TORCH_DISTRIBUTED_RANK": 0,
+    "USE_TORCH_DISTRIBUTED_LOCAL_RANK": 0,
+    "USE_TORCH_DISTRIBUTED_MASTER_ADDR": "localhost",
+    "USE_TORCH_DISTRIBUTED_TIMEOUT": "108000"
+  },
+  "wandb": {
+    "enable": true,
+    "project": "dinov3_lvis_oi_rtdetr",
+    "run_name": "focal_vfl_classaware",
+    "key": "ADD_YOUR_OWN_KEY"
+  }
+}

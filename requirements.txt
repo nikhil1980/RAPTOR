@@ -1,0 +1,51 @@
+# NOTE:
+# 1. This file is for pip installations only and that too for CPU
+# 2. If you want CUDA-specific PyTorch wheels, install torch/torchvision first using
+# the PyTorch index (e.g., CUDA 12.1) and then run pip install -r requirements.txt.
+
+# Generic
+requests
+python-dateutil
+
+# Core DL
+torch>=2.2.0
+torchvision>=0.17.0
+safetensors>=0.4.3
+
+# GPU utils
+accelerate
+
+# Hugging Face stack (use 'main' for DINOv3 backbone support)
+git+https://github.com/huggingface/transformers
+accelerate>=0.34.0
+datasets>=2.20.0
+evaluate>=0.4.2
+huggingface-hub>=0.23.0
+tokenizers>=0.15.0
+sentencepiece>=0.1.99
+
+# Detection / metrics
+pycocotools>=2.0.7
+lvis>=0.5.3
+scipy
+
+# Open-vocabulary (CLIP/SigLIP)
+open-clip-torch>=2.24.0
+ftfy>=6.1.1
+
+# Data & visualization
+pillow>=10.2.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+pandas
+
+# Dataset tooling (OpenImages via FiftyOne)
+fiftyone>=0.23.0
+
+# Experiment tracking
+wandb>=0.17.0
+
+# Progressbar
+tqdm>=4.66.0
+alive-progress
+

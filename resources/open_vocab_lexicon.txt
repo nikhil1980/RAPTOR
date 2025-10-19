@@ -1,0 +1,24 @@
+# Open Vocabulary labels of interest
+
+# Kindly follow this while extending this file
+# 1. Put one label per line (thousands are fine).
+# 2. Good sources include OpenImages class names, Visual Genome objects, LVIS categories + synonyms etc.
+# 3. Ask your QA to give images with labels
+
+
+stethoscope
+vinyl record
+espresso cup
+bottle opener
+ukulele
+martini glass
+electric scooter
+bulldozer
+wine decanter
+saree
+bindi
+leggings
+salwar
+lehenga
+dupatta
+blouse
