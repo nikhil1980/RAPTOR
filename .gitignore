@@ -58,6 +58,9 @@ cover/
 # Models
 model/
 
+# Datasets
+datasets/
+
 # Django stuff:
 *.log
 local_settings.py

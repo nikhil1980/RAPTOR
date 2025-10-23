@@ -18,7 +18,7 @@ Script for setting up logging configuration across the application.
 
 
 # Take Defaults from os.getenv
-_DEFAULT_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_DEFAULT_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
 _DEFAULT_LOGFILE = os.getenv("LOG_FILE", "")  # empty = no file and send to console
 _MAX_BYTES = int(os.getenv("LOG_ROTATE_MAX_BYTES", str(10 * 1024 * 1024)))  # 10MB
 _BACKUPS = int(os.getenv("LOG_ROTATE_BACKUPS", "5"))

@@ -1,14 +1,14 @@
 {
   "project": {
     "name": "RAPTOR",
-    "mode": "production"
+    "mode": "development"
   },
   "datasets": "COCO, LVIS, OPENIMAGES, CUSTOM",
   "paths": {
     "root": "datasets/mixture",
     "log_file": "logs/raptor.log",
     "model_dir": "runs/dinov3_rtdetr",
-    "ablation_dir": "runs/ablation",
+    "ablation_dir": "runs/ablation"
   },
   "workflow": {
     "download_data": "Download data automatically from the internet if not present locally.",
@@ -20,7 +20,7 @@
     "ablation": "Run ablation studies with different configurations."
   },
   "logging": {
-    "level": "INFO",
+    "level": "DEBUG",
     "format": "%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s",
     "rotate_max_bytes": 10485760,
     "rotate_backups": 5
