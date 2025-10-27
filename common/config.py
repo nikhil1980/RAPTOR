@@ -28,7 +28,9 @@ class Config:
     TRAIN_IMG_DIRS = [ROOT + "/" + "images/train2017", COCO_ANN + "/" + "oi_train"] # DON'T CHANGE ORDER
     VAL_IMG_DIRS = [ROOT + "/" + "images/val2017", COCO_ANN + "/" + "oi_val"]
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+    SEED = 42
+    NUM_WORKERS = 8
+    
     PRETRAINED_BACKBONE = "facebook/dinov3-vitb16-pretrain-lvd1689m"  # accept license
     RTDETR_IMAGE_PROCESSOR = "PekingU/rtdetr_r50vd"
     TEXT_ENCODER = "google/siglip-so400m-patch14-384"

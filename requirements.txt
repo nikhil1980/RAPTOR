@@ -7,6 +7,9 @@
 requests
 python-dateutil
 
+# For OpenImages
+awscli
+
 # Core DL
 torch>=2.2.0
 torchvision>=0.17.0
@@ -24,7 +27,7 @@ huggingface-hub>=0.23.0
 tokenizers>=0.15.0
 sentencepiece>=0.1.99
 
-# Detection / metrics
+# Detection/metrics
 pycocotools>=2.0.7
 lvis>=0.5.3
 scipy
@@ -41,6 +44,7 @@ pandas
 
 # Dataset tooling (OpenImages via FiftyOne)
 fiftyone>=0.23.0
+fiftyone-db
 
 # Experiment tracking
 wandb>=0.17.0
