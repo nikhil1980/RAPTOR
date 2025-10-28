@@ -72,7 +72,17 @@ from common.config import Config
 
 logger = get_logger(__name__)
 
+
+#------ Utility Functions ------
 def download_progress_hook(blocknum, blocksize, totalsize):
+    """
+    Report hook for urllib.request.urlretrieve to show download progress.
+    :param blocknum: Number of blocks transferred so far
+    :param blocksize: Size of each block (in bytes)
+    :param totalsize: Total size of the file (in bytes). May be -1 if unknown.  
+    
+    :return: None
+    """
     read_data = blocknum * blocksize
     if totalsize > 0:
         percentage = min(100, int(read_data * 100 / totalsize))
@@ -80,8 +90,14 @@ def download_progress_hook(blocknum, blocksize, totalsize):
     else:
         print(f"\rDownloading: {read_data} bytes", end="")
 
-# ---------- COCO/LVIS ----------
+
+# ---------- COCO ----------
 def download_coco_2017_images(dst: Path):
+    """
+    Downloads and extracts COCO 2017 train and val images to the specified directory.
+    :param dst: Path to the directory where images will be downloaded and extracted.
+    :return: None
+    """
     coco_urls = {
         "train2017": "http://images.cocodataset.org/zips/train2017.zip",
         "val2017":   "http://images.cocodataset.org/zips/val2017.zip",
@@ -99,11 +115,12 @@ def download_coco_2017_images(dst: Path):
         os.remove(zpath)
     logger.debug(f"---> [COCO] 2017 images ready at {dst} <---")
 
+
 def _http_session():
     s = requests.Session()
     retries = Retry(
         total=5,
-        backoff_factor=1.0,
+        backoff_factor=1,
         status_forcelist=[403, 429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "HEAD"])
     )
@@ -114,7 +131,15 @@ def _http_session():
     })
     return s
 
+
 def _stream_download(url: str, out_path: Path, chunk=1 << 20):
+    """
+    Stream download a file from a URL to a local path with progress reporting.
+    
+    :param url: The URL to download from.
+    :param out_path: The local file path to save the downloaded file.
+    :param chunk: The size of each chunk to read from the response.
+    :return: None"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with _http_session().get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -130,7 +155,17 @@ def _stream_download(url: str, out_path: Path, chunk=1 << 20):
                         print(f"\r[DL] {out_path.name}: {downloaded/1e6:.1f}/{total/1e6:.1f} MB ({pct:.1f}%)", end="")
         print()
 
+
+
 def _unzip_if_needed(zpath: Path):
+    """
+    Unzips a zip file if the target file does not already exist.
+    
+    
+    :param zpath: Path to the zip file.
+    :return: Path to the unzipped target file.
+    """
+
     target = zpath.with_suffix("")
     if target.exists():
         return target
@@ -140,6 +175,13 @@ def _unzip_if_needed(zpath: Path):
     return target
 
 def download_lvis_annotations(dst_dir: Path):
+    """
+    Download LVIS v1 annotations to the specified directory.
+    
+    :param dst_dir: Path to the directory where annotations will be downloaded.
+    :return: None
+    
+    """
     (dst_dir / "lvis").mkdir(parents=True, exist_ok=True)
     primary = {
         "lvis_v1_train.json.zip": "https://s3-us-west-2.amazonaws.com/dl.fbaipublicfiles.com/LVIS/lvis_v1_train.json.zip",
@@ -179,7 +221,11 @@ def download_lvis_annotations(dst_dir: Path):
         os.remove(zpath)
     print("[OK] LVIS v1 annotations ready.")
 
+
+# -----------------------------------
 # ---------- OpenImages V7 ----------
+# -----------------------------------
+
 OI_URLS: Dict[str, str] = {
     "train_ids":       "https://storage.googleapis.com/openimages/2018_04/train/train-images-boxable-with-rotation.csv",
     "validation_ids":  "https://storage.googleapis.com/openimages/2018_04/validation/validation-images-with-rotation.csv",
@@ -191,9 +237,27 @@ OI_URLS: Dict[str, str] = {
 }
 
 def _ensure_dir(path: str) -> None:
+    """
+    Ensures that a directory exists.
+    :param path: The directory path to ensure.
+    :type path: str
+    
+    :return: None
+    """
     os.makedirs(path, exist_ok=True)
+    
 
 def _download(url: str, dst: str) -> None:
+    """
+    Downloads a file from a URL to a specified destination with resume support.
+    
+    :param url: The URL to download from.
+    :type url: str
+    :param dst: The destination file path.
+    :type dst: str
+    
+    :return: None
+    """
     _ensure_dir(os.path.dirname(dst))
     headers = {}
     mode = "wb"
@@ -208,10 +272,19 @@ def _download(url: str, dst: str) -> None:
                 if chunk:
                     f.write(chunk)
 
+
+
 def _ensure_split_ids_csv(root: str, split: str) -> str:
+    """
+    Downloads official split ImageID list with rotation using the exact
+    filenames the V7 ecosystem expects, e.g.:
+      metadata/validation/validation-images-with-rotation.csv
+    Returns the full path to that file.
+    """
     meta_dir = os.path.join(root, "metadata", split)
     _ensure_dir(meta_dir)
-    out_csv = os.path.join(meta_dir, "image_ids.csv")
+    # use official name (not "image_ids.csv")
+    out_csv = os.path.join(meta_dir, f"{split}-images-with-rotation.csv")
     if not os.path.exists(out_csv):
         key = f"{split}_ids"
         if key not in OI_URLS:
@@ -221,6 +294,15 @@ def _ensure_split_ids_csv(root: str, split: str) -> str:
     return out_csv
 
 def _read_ids(csv_path: str) -> Set[str]:
+    """
+    Read ImageIDs from a CSV file.
+    
+    :param csv_path: Path to the CSV file.
+    :param csv_path: str
+    
+    :return: A set of ImageIDs.
+    :rtype: Set[str]    
+    """
     ids = set()
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -237,7 +319,20 @@ def _read_ids(csv_path: str) -> Set[str]:
             ids.add(row[idx])
     return ids
 
+
+
 def _cleanup_bad_media(split: str, dirpath: str) -> int:
+    """
+    Cleanup zero-byte files in the specified directory.
+    
+    :param split: The data split (e.g., 'train', 'validation', 'test').
+    :type split: str
+    :param dirpath: The directory path to clean up.
+    :type dirpath: str
+    
+    :return: The number of files removed.
+    :rtype: int
+    """
     touched = 0
     if not os.path.isdir(dirpath):
         return 0
@@ -252,12 +347,27 @@ def _cleanup_bad_media(split: str, dirpath: str) -> int:
             pass
     return touched
 
+
+
 def _rehydrate_images(root: str, split: str, idset: Set[str]) -> int:
+    """
+    Move images from data/ into data/{split}/ based on the provided ID set.
+    
+    :param root: The root directory containing the data folder.
+    :type root: str
+    :param split: The data split (e.g., 'train', 'validation', 'test').
+    :type split: str
+    
+    :return: The number of files moved.
+    :rtype: int
+    
+    :raises FileNotFoundError: If the root/data directory does not exist.
+    """
     data_root = os.path.join(root, "data")
     split_dir = os.path.join(data_root, split)
     _ensure_dir(split_dir)
     moved = 0
-    for entry in tqdm(os.scandir(data_root), desc=f"rehydrate:{split}", unit="img"):
+    for entry in tqdm(os.scandir(data_root), desc=f"rehydrate:{split} ", unit="img"):
         if not entry.is_file():
             continue
         stem, ext = os.path.splitext(entry.name)
@@ -271,7 +381,24 @@ def _rehydrate_images(root: str, split: str, idset: Set[str]) -> int:
     logger.info(f"[Rehydrate] Moved {moved} file(s) into {split_dir}")
     return moved
 
+
+
 def _split_detections_if_needed(root: str, split: str, idset: Set[str]) -> Optional[str]:
+    """
+    Function to split detections.csv into per-split CSV files if needed.
+    
+    :param root: The root directory containing the labels folder.
+    :type root: str
+    
+    :param split: The data split (e.g., 'train', 'validation', 'test').
+    :type split: str
+
+    :param idset: A set of ImageIDs for the specified split.
+    :type idset: Set[str]
+    
+    :return: The path to the split detections CSV file, or None if not found.
+    :rtpye: Optional[str]
+    """
     labels_dir = os.path.join(root, "labels")
     det_all = os.path.join(labels_dir, "detections.csv")
     det_split = os.path.join(labels_dir, "detections", f"{split}-annotations-bbox.csv")
@@ -280,8 +407,10 @@ def _split_detections_if_needed(root: str, split: str, idset: Set[str]) -> Optio
     if not os.path.exists(det_all):
         return None
     _ensure_dir(os.path.dirname(det_split))
+
     logger.info(f"---> [Labels] Creating split boxes for {split} from detections.csv → {det_split} <---")
-    chunksize = 1_000_000
+
+    chunksize = 1_000_000 # Set to larger value if you have more memory
     wrote_header = False
     with open(det_split, "w", newline="") as out_f:
         for chunk in pd.read_csv(det_all, chunksize=chunksize):
@@ -295,11 +424,20 @@ def _split_detections_if_needed(root: str, split: str, idset: Set[str]) -> Optio
                 wrote_header = True
             else:
                 sub.to_csv(out_f, index=False, header=False)
+                
     if os.path.getsize(det_split) == 0:
         logger.warning(f"---> [Labels] No detections found for {split} in detections.csv (file left empty) <---")
     return det_split
 
+
+
 def _resolve_oi_dataset_type():
+    """
+    Function to resolve the appropriate OpenImages dataset type from FiftyOne.
+    
+    :return: The OpenImages dataset type class.
+    :rtype: type
+    """
     try:
         from fiftyone.types.dataset_types import OpenImagesV7Dataset as OIType
         return OIType
@@ -307,29 +445,78 @@ def _resolve_oi_dataset_type():
         from fiftyone.types.dataset_types import OpenImagesDataset as OIType
         return OIType
 
+
+
 def _existing_image_path(dir_split: str, image_id: str) -> Optional[str]:
+    """
+    Check for existing image file with common extensions.
+    
+    :param dir_split: The directory to search in.
+    :type dir_split: str
+    
+    :param image_id: The image ID to look for.
+    :type image_id: str
+    
+    :return: The path to the existing image file, or None if not found.
+    :rtype: Optional[str]
+    """
     for ext in (".jpg", ".jpeg", ".png"):
         p = os.path.join(dir_split, image_id + ext)
         if os.path.exists(p):
             return p
     return None
 
+
+
 def _find_missing_ids(split: str, dir_split: str, idset: Set[str]) -> List[str]:
     """
-    Recursively scan dir_split (handles accidental data/<split>/<split>/ nesting)
-    and treat any *.jpg|*.jpeg|*.png as present for the image_id stem.
+    Recursively scan dir_split and treat any *.jpg|*.jpeg|*.png as present
+    regardless of accidental nesting from tar extraction.
+    
+    :param split: The data split (e.g., 'train', 'validation', 'test').
+    :type split: str
+    :param dir_split: The directory path for the split.
+    :type dir_split: str
+    :param idset: A set of ImageIDs for the specified split.
+    :type idset: Set[str]
+    
+    :return: A sorted list of missing ImageIDs.
+    :rtype: List[str]
     """
     have = set()
     if os.path.isdir(dir_split):
-        for root, _, files in os.walk(dir_split):
+        for root_dir, _, files in os.walk(dir_split):
             for n in files:
                 stem, ext = os.path.splitext(n)
                 if ext.lower() in (".jpg", ".jpeg", ".png"):
                     have.add(stem)
-    missing = sorted(list(idset - have))
-    return missing
+    return sorted(list(idset - have))
 
-def _http_download_one(url_tmpl: str, dir_split: str, image_id: str, timeout=40) -> bool:
+
+
+def _http_download_one(url_tmpl: str, 
+                       dir_split: str, 
+                       image_id: str, 
+                       timeout=40
+                       ) -> bool:
+    """
+    Function to download a single image via HTTP.
+    
+    :param url_tmpl: The URL template with a placeholder for the image ID.
+    :type url_tmpl: str
+    
+    :param dir_split: The directory to save the downloaded image.
+    :type dir_split: str
+    
+    :param image_id: The image ID to download.
+    :type image_id: str
+    
+    :param timeout: The timeout for the HTTP request.
+    :type timeout: int
+    
+    :return: True if the image was downloaded, False otherwise.
+    :rtype: bool
+    """
     dst = os.path.join(dir_split, f"{image_id}.jpg")
     if os.path.exists(dst) and os.path.getsize(dst) > 0:
         return False
@@ -350,20 +537,50 @@ def _http_download_one(url_tmpl: str, dir_split: str, image_id: str, timeout=40)
         except Exception:
             pass
         return False
-
+    
+    
+    
+# Official OpenImages image URL templates
 OI_IMG_URL = {
     "train":      "https://storage.googleapis.com/openimages/2018_04/train/{id}.jpg",
     "validation": "https://storage.googleapis.com/openimages/2018_04/validation/{id}.jpg",
     "test":       "https://storage.googleapis.com/openimages/2018_04/test/{id}.jpg",
 }
 
-def _download_missing_images_manual(split: str, dir_split: str, missing_ids: List[str], workers: int = 32) -> int:
+
+# ---------- AWS CVDF tar (validation/test) helpers for OPENIMAGES v7 ----------
+S3_TARS = {
+    "validation": "s3://open-images-dataset/tar/validation.tar.gz",
+    "test":       "s3://open-images-dataset/tar/test.tar.gz",
+}
+
+
+def _download_missing_images_manual(split: str, 
+                                    dir_split: str, 
+                                    missing_ids: List[str], 
+                                    workers: int = 32
+                                    ) -> int:
+    """
+    Download missing images manually via HTTP.
+    
+    :param split: The data split (e.g., 'train', 'validation', 'test').
+    :type split: str
+    :param dir_split: The directory path for the split.
+    :type dir_split: str
+    :param missing_ids: A list of missing ImageIDs to download.
+    :type missing_ids: List[str]
+    :param workers: The number of concurrent download workers.
+    :type workers: int
+    
+    :return: The number of images downloaded.
+    :rtype: int
+    """
     url_tmpl = OI_IMG_URL[split]
     fetch = partial(_http_download_one, url_tmpl, dir_split)
     done = 0
     if not missing_ids:
         return 0
-    logger.info(f"---> [Images] Missing count for {split}: {len(missing_ids)} — downloading only those <---")
+    logger.info(f"---> [IMAGES] Missing count for {split}: {len(missing_ids)} — downloading only those <---")
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(fetch, iid) for iid in missing_ids]
         for fut in as_completed(futs):
@@ -371,7 +588,30 @@ def _download_missing_images_manual(split: str, dir_split: str, missing_ids: Lis
                 done += 1
     return done
 
-def _download_missing_images_via_fiftyone(root: str, split: str, missing_ids: List[str], shuffle: bool, seed: int) -> None:
+
+
+def _download_missing_images_via_fiftyone(root: str, 
+                                          split: str, 
+                                          missing_ids: List[str], 
+                                          shuffle: bool, 
+                                          seed: int
+                                          ) -> None:
+    """
+    Download missing images using FiftyOne's OpenImages downloader.
+    
+    :param root: The root directory containing the data folder.
+    :type root: str
+    :param split: The data split (e.g., 'train', 'validation', 'test').
+    :type split: str
+    :param missing_ids: A list of missing ImageIDs to download.
+    :type missing_ids: List[str]
+    :param shuffle: Whether to shuffle the download order.
+    :type shuffle: bool
+    :param seed: The random seed for shuffling.
+    :type seed: int
+    
+    :return: None
+    """
     fouo.download_open_images_split(
         dataset_dir=root,
         split=split,
@@ -385,13 +625,26 @@ def _download_missing_images_via_fiftyone(root: str, split: str, missing_ids: Li
         max_samples=None,
     )
 
-# ---------- CVDF tar (validation/test) helpers ----------
-S3_TARS = {
-    "validation": "s3://open-images-dataset/tar/validation.tar.gz",
-    "test":       "s3://open-images-dataset/tar/test.tar.gz",
-}
 
-def _run(cmd, cwd=None, check=True):
+
+def _run(cmd, 
+         cwd=None, 
+         check=True
+         ) -> str:
+    """
+    Run a command as a subprocess and capture its output.
+    Used for awscli commands.
+    
+    :param cmd: The command to run as a list of arguments.
+    :type cmd: List[str]
+    :param cwd: The working directory to run the command in.
+    :type cwd: Optional[str]
+    :param check: Whether to raise an error if the command fails.
+    :type check: bool
+    
+    :return: The standard output of the command.
+    :rtype: str
+    """
     print("[RUN]", " ".join(cmd))
     proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if check and proc.returncode != 0:
@@ -399,29 +652,35 @@ def _run(cmd, cwd=None, check=True):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return proc.stdout
 
+
+
 def _has_awscli() -> bool:
+    """
+    Check if the AWS CLI is installed.
+    
+    :return: True if AWS CLI is installed, False otherwise.
+    :rtype: bool
+    """
     return shutil.which("aws") is not None
+
+
 
 def _tar_extract_strip1(tar_path: str, dst_dir: str):
     """
-    Extract tar.gz while stripping the first path component so that files in
+    Extract tar.gz while stripping the first path component so files in
     'validation/...jpg' land directly under dst_dir, not dst_dir/validation/.
     """
     os.makedirs(dst_dir, exist_ok=True)
     with tarfile.open(tar_path, "r:gz") as tf:
         members = []
         for m in tf.getmembers():
-            # strip first component if present
             parts = m.name.split("/", 1)
-            if len(parts) == 2:
-                m.name = parts[1]
-            else:
-                # already a file at root
-                m.name = parts[0]
+            m.name = parts[1] if len(parts) == 2 else parts[0]
             if m.name and not m.name.endswith("/"):
                 members.append(m)
         tf.extractall(dst_dir, members=members)
-
+        
+        
 def _fetch_split_tar_to(split: str, split_dir: str):
     """
     Download split tar.gz from CVDF (no auth) and extract into data/{split}/
@@ -438,7 +697,29 @@ def _fetch_split_tar_to(split: str, split_dir: str):
 
     _tar_extract_strip1(tmp_tar, split_dir)
     os.remove(tmp_tar)
+    
 
+def _ensure_validation_labels(root: str):
+    """
+    Download official validation detections CSV + class map to expected paths:
+      labels/detections/validation-annotations-bbox.csv
+      labels/class-descriptions-boxable.csv
+    """
+    labels_dir = os.path.join(root, "labels")
+    det_dir = os.path.join(labels_dir, "detections")
+    _ensure_dir(det_dir)
+
+    det_csv = os.path.join(det_dir, "validation-annotations-bbox.csv")
+    if not os.path.exists(det_csv):
+        logger.info(f"[Labels] Downloading {det_csv}")
+        _download(OI_URLS["validation_boxes"], det_csv)
+
+    cls_csv = os.path.join(labels_dir, "class-descriptions-boxable.csv")
+    if not os.path.exists(cls_csv):
+        logger.info(f"[Labels] Downloading {cls_csv}")
+        _download(OI_URLS["classes_boxable"], cls_csv)
+        
+        
 def _download_with_official_downloader(root: str, split: str, ids):
     dl = os.path.join(tempfile.gettempdir(), "downloader.py")
     if not os.path.exists(dl):
@@ -449,38 +730,38 @@ def _download_with_official_downloader(root: str, split: str, ids):
             f.write(_id if _id.startswith(f"{split}/") else f"{split}/{_id}\n")
     _run([sys.executable, dl, idstxt, "--download_folder", os.path.join(root, "data"), "--num_processes", "8"])
 
+
 def _flatten_split_dir(split_dir: str, split: str) -> int:
     """
-    If tar created data/<split>/<split>/..., move all files up one level.
-    Returns count of files moved.
+    If tar created data/<split>/<split>/..., move files up one level.
     """
     nested = os.path.join(split_dir, split)
     moved = 0
     if os.path.isdir(nested):
-        for root, _, files in os.walk(nested):
-            rel = os.path.relpath(root, nested)
+        for root_dir, _, files in os.walk(nested):
+            rel = os.path.relpath(root_dir, nested)
             dst_root = os.path.join(split_dir, rel) if rel != "." else split_dir
             os.makedirs(dst_root, exist_ok=True)
             for fn in files:
-                src = os.path.join(root, fn)
+                src = os.path.join(root_dir, fn)
                 dst = os.path.join(dst_root, fn)
                 if not os.path.exists(dst):
                     os.replace(src, dst)
                     moved += 1
-        # cleanup empty dirs
-        for root, dirs, files in os.walk(nested, topdown=False):
+        # cleanup dirs
+        for root_dir, dirs, _ in os.walk(nested, topdown=False):
             for d in dirs:
-                p = os.path.join(root, d)
                 try:
-                    os.rmdir(p)
+                    os.rmdir(os.path.join(root_dir, d))
                 except OSError:
                     pass
         try:
             os.rmdir(nested)
         except OSError:
             pass
-        logger.info(f"[Flatten] Moved {moved} files up from {nested} into {split_dir}")
+        logger.info(f"[Flatten] Moved {moved} files up from {nested}")
     return moved
+
 
 # ---------- OpenImages V7 via FiftyOne ----------
 def download_openimages(split="train",
@@ -494,10 +775,9 @@ def download_openimages(split="train",
                         seed: int = Config.SEED,
                         prefer_manual_images: bool = True) -> fo.Dataset:
     """
-    Valid for 'train', 'validation', and 'test'.
-    * For validation/test, uses CVDF tarballs (no auth) if images are missing.
-    * Hydrates validation labels so OpenImagesV7 importer can enumerate.
-    * Test is images-only (no detections exist).
+    'train' (you already have), 'validation', and 'test'.
+    For validation/test: use CVDF tarballs for images, direct CSV URLs for labels (validation).
+    Zero FiftyOne S3 downloads are used here to avoid 403/404.
     """
     root = download_dir or os.path.expanduser(os.path.join("~", "fiftyone", "open-images-v7"))
     data_root = os.path.join(root, "data")
@@ -508,75 +788,37 @@ def download_openimages(split="train",
     if dataset_name is None:
         dataset_name = f"openimages-v7-{split}-det" if split != "test" else "openimages-v7-test-imgs"
 
-    # 1) image IDs for the split
+    # 1) Official image IDs CSV for the split (importer-friendly filename)
     ids_csv = _ensure_split_ids_csv(root, split)
-    idset = _read_ids(ids_csv)
+    idset   = _read_ids(ids_csv)
     if not idset:
         raise FileNotFoundError(f"Could not read any ImageIDs for split '{split}' from {ids_csv}")
 
     split_dir = os.path.join(data_root, split)
     _ensure_dir(split_dir)
 
-    # 2) Count present/missing (recursive to handle accidental nesting)
+    # 2) Fill images (CVDF tarballs) and fix nesting
     missing_ids = _find_missing_ids(split, split_dir, idset)
     logger.info(f"[{split}] Present={len(idset)-len(missing_ids)}  Missing={len(missing_ids)}")
 
-    # 3) Fill images
-    if missing_ids:
-        if prefer_manual_images and split in ("validation", "test"):
-            print(f"[{split}] Fetching CVDF tarball (S3)…")
-            _fetch_split_tar_to(split, split_dir)
-            # fix possible nested split folder
-            _flatten_split_dir(split_dir, split)
-            # recount after extraction
-            missing_ids = _find_missing_ids(split, split_dir, idset)
-            logger.info(f"[{split}] After tar: Present={len(idset)-len(missing_ids)}  Missing={len(missing_ids)}")
-            # If still missing a subset (rare), grab those via official downloader
-            if missing_ids:
-                print(f"[{split}] Downloading {len(missing_ids)} missing via official downloader.py…")
-                _download_with_official_downloader(root, split, missing_ids)
-        else:
-            # Either train or manual_images=False → try FO downloader or per-ID HTTP
-            if split == "train":
-                # You already fetched train; keep per-ID fallback here if needed
-                fetched = _download_missing_images_manual(split, split_dir, missing_ids, workers=(num_workers or 32))
-                logger.info(f"[{split}] Manually fetched {fetched} images")
-            else:
-                fouo.download_open_images_split(
-                    dataset_dir=root,
-                    split=split,
-                    version="v7",
-                    label_types=[],            # images only
-                    classes=None,
-                    image_ids=missing_ids,
-                    num_workers=os.cpu_count(),
-                    shuffle=shuffle,
-                    seed=seed,
-                    max_samples=None,
-                )
-                _flatten_split_dir(split_dir, split)
+    if split in ("validation", "test") and (missing_ids and prefer_manual_images):
+        print(f"[{split}] Fetching CVDF tarball…")
+        _fetch_split_tar_to(split, split_dir)
+        _flatten_split_dir(split_dir, split)
+        # Recount after tar
+        missing_ids = _find_missing_ids(split, split_dir, idset)
+        logger.info(f"[{split}] After tar: Present={len(idset)-len(missing_ids)}  Missing={len(missing_ids)}")
 
-    # 4) Clean zero-byte/HTML leftovers
+    # final clean
     cleaned = _cleanup_bad_media(split, split_dir)
     if cleaned:
-        logger.info(f"[{split}] Cleaned {cleaned} bad files under {split_dir}")
+        logger.info(f"[{split}] Cleaned {cleaned} files under {split_dir}")
 
-    # 5) Hydrate labels for validation; test has no detections
-    if split == "validation":
-        fouo.download_open_images_split(
-            dataset_dir=root,
-            split="validation",
-            version="v7",
-            label_types=list(label_types),     # ('detections',)
-            classes=classes,
-            image_ids=None,                    # full split
-            num_workers=8,
-            shuffle=False,
-            seed=seed,
-            max_samples=None,
-        )
+    # 3) Labels: validation only (test has no detections)
+    if split == "validation" and "detections" in set(label_types):
+        _ensure_validation_labels(root)
 
-    # 6) Load dataset
+    # 4) Load dataset
     if fo.dataset_exists(dataset_name):
         fo.delete_dataset(dataset_name)
 
@@ -588,16 +830,16 @@ def download_openimages(split="train",
             name=dataset_name,
         )
     else:
-        # Ensure IDs file exists (split-prefixed)
+        # Build image_ids file in 'split/<ID>' format
         ids_file = _ensure_prefixed_ids_file(root, split)
         OIType = _resolve_oi_dataset_type()
         logger.info(f"---> [Load] root='{root}', split='{split}', dataset='{dataset_name}' <---")
         ds = fo.Dataset.from_dir(
             dataset_dir=root,
             dataset_type=OIType,
-            label_types=list(label_types),
+            label_types=list(label_types),   # ('detections',) for validation
             classes=classes,
-            image_ids=ids_file,      # lines like 'validation/<ImageID>'
+            image_ids=ids_file,              # lines like 'validation/<ImageID>'
             include_id=True,
             name=dataset_name,
         )
@@ -606,27 +848,35 @@ def download_openimages(split="train",
     logger.info(f"[OpenImages] Loaded: {ds.name} | split={split} | samples={len(ds)}")
     return ds
 
+
 def _ensure_prefixed_ids_file(root: str, split: str) -> str:
+    """
+    Builds metadata/{split}/image_ids_prefixed.txt from:
+      metadata/{split}/{split}-images-with-rotation.csv
+    with lines like 'validation/<ImageID>'.
+    """
     meta_dir = os.path.join(root, "metadata", split)
     os.makedirs(meta_dir, exist_ok=True)
-    src_csv = os.path.join(meta_dir, "image_ids.csv")
+    src_csv = os.path.join(meta_dir, f"{split}-images-with-rotation.csv")
     out_txt = os.path.join(meta_dir, "image_ids_prefixed.txt")
+
     if os.path.exists(out_txt) and os.path.getsize(out_txt) > 0:
         return out_txt
     if not os.path.exists(src_csv):
         raise FileNotFoundError(f"Missing {src_csv}")
+
     with open(src_csv, "r", newline="", encoding="utf-8") as f, open(out_txt, "w") as g:
         r = csv.reader(f)
         header = next(r, None)
         idx = 0 if not header or "ImageID" not in header else header.index("ImageID")
-        if header and ("ImageID" not in header):
-            if header and len(header) > idx:
-                g.write(f"{split}/{header[idx].strip()}\n")
+        if header and "ImageID" not in header and header and len(header) > idx:
+            g.write(f"{split}/{header[idx].strip()}\n")
         for row in r:
             if not row:
                 continue
             g.write(f"{split}/{row[idx].strip()}\n")
     return out_txt
+
 
 # ---------- main ----------
 def main():
@@ -664,6 +914,9 @@ def main():
                 download_dir = os.path.join(base_path, "open-images-v7")
                 os.makedirs(download_dir, exist_ok=True)
 
+                # 1. Train (USe Google storage) 
+                """download_openimages(split="train", label_types=("detections",), max_samples=None, download_dir=download_dir, prefer_manual_images=True )"""
+                
                 # Validation (detections)
                 download_openimages(
                     split="validation",
