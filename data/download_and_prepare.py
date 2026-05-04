@@ -70,6 +70,43 @@ from common.logger import get_logger
 from common.myargparser import build_myargparser
 from common.config import Config
 
+
+"""
+@author: Nikhil Bhargava
+@date: October 31, 2025
+@description: This module contains functions to download and prepare datasets such as COCO, LVIS, and OpenImages V7.
+@copyright: Nikhil Bhargava
+
+To run download_and_prepare.py
+-----------------------------
+# 1) Choose a place for Mongo’s data/logs
+export FO_MONGO_DIR=/raid/home/nikhilb/fo_mongo
+mkdir -p "$FO_MONGO_DIR"
+
+# 2) Stop any stray mongod and stale locks
+pkill -f mongod || true
+rm -f "$FO_MONGO_DIR/mongod.lock"
+
+# 3) Give the process enough file descriptors (important)
+ulimit -n 64000
+
+# 4) Start mongod yourself on a fixed port (27100), in the background
+MONGOD_BIN="/root/.pyenv/versions/raptor-env/lib/python3.11/site-packages/fiftyone/db/bin/mongod"
+"$MONGOD_BIN" \
+  --dbpath "$FO_MONGO_DIR" \
+  --logpath "$FO_MONGO_DIR/mongo.log" \
+  --bind_ip 127.0.0.1 \
+  --port 27100 \
+  --nounixsocket \
+  --wiredTigerCacheSizeGB 4 \
+  --fork
+
+python data/download_and_prepare.py --config-file config.json > main_log.log 2>&1 &
+tail -f main_log.log
+
+"""
+
+
 logger = get_logger(__name__)
 
 
