@@ -140,13 +140,14 @@ def download_coco_2017_images(dst: Path):
         zpath = dst/f"{split}.zip"
         if not zpath.exists():
             logger.debug(f"---> [COCO] downloading {split} ...<---")
-            urllib.request.urlretrieve(url, zpath, reporthook=download_progress_hook)
+            _stream_download(url, zpath)
         outdir = dst/split
         outdir.mkdir(exist_ok=True)
         if not any(outdir.iterdir()):
             logger.debug(f"--> [COCO] extracting {zpath} ... <---")
             with zipfile.ZipFile(zpath,"r") as zf: zf.extractall(dst)
-        os.remove(zpath)
+        if zpath.exists():
+            os.remove(zpath)
     logger.debug(f"---> [COCO] 2017 images ready at {dst} <---")
 
 
