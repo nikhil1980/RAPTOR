@@ -1,0 +1,71 @@
+# Conda environment for RAPTOR — A100 + CUDA 12.4
+# WARNING: Python 3.14 support in PyTorch / fiftyone / open-clip-torch
+#          may be limited. If conda solve fails, try python=3.12.
+#
+# Create:  conda env create -f environment.yaml
+# Activate: conda activate raptor
+# Update:  conda env update -f environment.yaml --prune
+
+name: raptor
+
+channels:
+  - pytorch          # provides torch + torchvision CUDA builds
+  - nvidia           # provides cuda-toolkit, cudnn
+  - conda-forge      # everything else
+  - defaults
+
+dependencies:
+  - python=3.12.6
+  - pip
+
+  # PyTorch — CUDA 12.4 build from the pytorch channel
+  - pytorch::pytorch>=2.6.0
+  - pytorch::torchvision>=0.21.0
+  - pytorch::torchaudio==2.6.0
+  - pytorch-cuda=12.4
+
+  # Core system libs (conda handles ABI better than pip here)
+  - numpy>=1.26.0
+  - pillow>=10.2.0
+  - scipy
+  - matplotlib>=3.8.0
+  - pandas
+  - tqdm>=4.66.0
+
+  # AWS CLI (conda-forge has a clean build)
+  - conda-forge::awscli
+
+  - pip:
+    # ------------------------------------------------------------------ #
+    # Hugging Face stack
+    # Install transformers from HEAD for DINOv3 backbone support
+    - git+https://github.com/huggingface/transformers
+    - accelerate>=0.34.0
+    - datasets>=2.20.0
+    - evaluate>=0.4.2
+    - huggingface-hub>=0.23.0
+    - tokenizers>=0.15.0
+    - sentencepiece>=0.1.99
+    - safetensors>=0.4.3
+
+    # Open-vocabulary (CLIP / SigLIP)
+    - open-clip-torch>=2.24.0
+    - ftfy>=6.1.1
+
+    # Detection & evaluation metrics
+    - pycocotools>=2.0.7
+    - lvis>=0.5.3
+
+    # Dataset tooling — OpenImages download via FiftyOne
+    - fiftyone>=0.23.0
+    - fiftyone-db
+
+    # Experiment tracking
+    - wandb>=0.17.0
+
+    # Progress
+    - alive-progress
+
+    # Misc utilities
+    - requests
+    - python-dateutil

@@ -2,18 +2,17 @@ import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import subprocess
-import textwrap, tempfile, json, shutil
+import tempfile, json, shutil, zipfile, urllib.request, tarfile
 import pandas as pd
 import csv
-from typing import Iterable, Dict, Optional, Set, List
+from typing import Dict, Optional, Set, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 import requests
-import json, zipfile, urllib.request, tarfile   # <-- added tarfile
 import time
 from pathlib import Path
 from tqdm import tqdm
-import logging.config, os
+import logging.config
 
 os.environ["FIFTYONE_LOGGING_LEVEL"] = "WARNING"
 
@@ -57,9 +56,6 @@ import fiftyone as fo
 import fiftyone.utils.openimages as fouo
 from fiftyone.core.odm.database import get_db_client
 
-get_db_client().server_info()
-print("OK: FiftyOne is using external Mongo:", fo.config.database_uri)
-
 from requests.adapters import HTTPAdapter, Retry
 
 import warnings; warnings.filterwarnings("ignore")
@@ -91,7 +87,8 @@ rm -f "$FO_MONGO_DIR/mongod.lock"
 ulimit -n 64000
 
 # 4) Start mongod yourself on a fixed port (27100), in the background
-MONGOD_BIN="/root/.pyenv/versions/raptor-env/lib/python3.11/site-packages/fiftyone/db/bin/mongod"
+#    Resolve the bundled mongod from whichever env (conda, venv, pyenv) is active:
+MONGOD_BIN="$(python -c "import os, fiftyone; print(os.path.join(os.path.dirname(fiftyone.__file__), 'db', 'bin', 'mongod'))")"
 "$MONGOD_BIN" \
   --dbpath "$FO_MONGO_DIR" \
   --logpath "$FO_MONGO_DIR/mongo.log" \
@@ -386,85 +383,6 @@ def _cleanup_bad_media(split: str, dirpath: str) -> int:
 
 
 
-def _rehydrate_images(root: str, split: str, idset: Set[str]) -> int:
-    """
-    Move images from data/ into data/{split}/ based on the provided ID set.
-    
-    :param root: The root directory containing the data folder.
-    :type root: str
-    :param split: The data split (e.g., 'train', 'validation', 'test').
-    :type split: str
-    
-    :return: The number of files moved.
-    :rtype: int
-    
-    :raises FileNotFoundError: If the root/data directory does not exist.
-    """
-    data_root = os.path.join(root, "data")
-    split_dir = os.path.join(data_root, split)
-    _ensure_dir(split_dir)
-    moved = 0
-    for entry in tqdm(os.scandir(data_root), desc=f"rehydrate:{split} ", unit="img"):
-        if not entry.is_file():
-            continue
-        stem, ext = os.path.splitext(entry.name)
-        if ext.lower() not in (".jpg", ".jpeg", ".png"):
-            continue
-        if stem in idset:
-            dst = os.path.join(split_dir, entry.name)
-            if not os.path.exists(dst):
-                os.replace(entry.path, dst)
-                moved += 1
-    logger.info(f"[Rehydrate] Moved {moved} file(s) into {split_dir}")
-    return moved
-
-
-
-def _split_detections_if_needed(root: str, split: str, idset: Set[str]) -> Optional[str]:
-    """
-    Function to split detections.csv into per-split CSV files if needed.
-    
-    :param root: The root directory containing the labels folder.
-    :type root: str
-    
-    :param split: The data split (e.g., 'train', 'validation', 'test').
-    :type split: str
-
-    :param idset: A set of ImageIDs for the specified split.
-    :type idset: Set[str]
-    
-    :return: The path to the split detections CSV file, or None if not found.
-    :rtpye: Optional[str]
-    """
-    labels_dir = os.path.join(root, "labels")
-    det_all = os.path.join(labels_dir, "detections.csv")
-    det_split = os.path.join(labels_dir, "detections", f"{split}-annotations-bbox.csv")
-    if os.path.exists(det_split):
-        return det_split
-    if not os.path.exists(det_all):
-        return None
-    _ensure_dir(os.path.dirname(det_split))
-
-    logger.info(f"---> [Labels] Creating split boxes for {split} from detections.csv → {det_split} <---")
-
-    chunksize = 1_000_000 # Set to larger value if you have more memory
-    wrote_header = False
-    with open(det_split, "w", newline="") as out_f:
-        for chunk in pd.read_csv(det_all, chunksize=chunksize):
-            if "ImageID" not in chunk.columns:
-                chunk.rename(columns={chunk.columns[0]: "ImageID"}, inplace=True)
-            sub = chunk[chunk["ImageID"].isin(idset)]
-            if sub.empty:
-                continue
-            if not wrote_header:
-                sub.to_csv(out_f, index=False)
-                wrote_header = True
-            else:
-                sub.to_csv(out_f, index=False, header=False)
-                
-    if os.path.getsize(det_split) == 0:
-        logger.warning(f"---> [Labels] No detections found for {split} in detections.csv (file left empty) <---")
-    return det_split
 
 
 
@@ -484,24 +402,6 @@ def _resolve_oi_dataset_type():
 
 
 
-def _existing_image_path(dir_split: str, image_id: str) -> Optional[str]:
-    """
-    Check for existing image file with common extensions.
-    
-    :param dir_split: The directory to search in.
-    :type dir_split: str
-    
-    :param image_id: The image ID to look for.
-    :type image_id: str
-    
-    :return: The path to the existing image file, or None if not found.
-    :rtype: Optional[str]
-    """
-    for ext in (".jpg", ".jpeg", ".png"):
-        p = os.path.join(dir_split, image_id + ext)
-        if os.path.exists(p):
-            return p
-    return None
 
 
 
@@ -627,40 +527,6 @@ def _download_missing_images_manual(split: str,
 
 
 
-def _download_missing_images_via_fiftyone(root: str, 
-                                          split: str, 
-                                          missing_ids: List[str], 
-                                          shuffle: bool, 
-                                          seed: int
-                                          ) -> None:
-    """
-    Download missing images using FiftyOne's OpenImages downloader.
-    
-    :param root: The root directory containing the data folder.
-    :type root: str
-    :param split: The data split (e.g., 'train', 'validation', 'test').
-    :type split: str
-    :param missing_ids: A list of missing ImageIDs to download.
-    :type missing_ids: List[str]
-    :param shuffle: Whether to shuffle the download order.
-    :type shuffle: bool
-    :param seed: The random seed for shuffling.
-    :type seed: int
-    
-    :return: None
-    """
-    fouo.download_open_images_split(
-        dataset_dir=root,
-        split=split,
-        version="v7",
-        label_types=[],
-        classes=None,
-        image_ids=missing_ids,
-        num_workers=os.cpu_count(),
-        shuffle=shuffle,
-        seed=seed,
-        max_samples=None,
-    )
 
 
 
@@ -730,7 +596,9 @@ def _fetch_split_tar_to(split: str, split_dir: str):
     if _has_awscli():
         _run(["aws", "s3", "--no-sign-request", "cp", url, tmp_tar])
     else:
-        _run(["curl", "-L", "-o", tmp_tar, url])
+        # S3 URIs can't be used with curl; map to the public HTTPS endpoint
+        https_url = url.replace("s3://open-images-dataset/", "https://open-images-dataset.s3.amazonaws.com/")
+        _run(["curl", "-L", "-o", tmp_tar, https_url])
 
     _tar_extract_strip1(tmp_tar, split_dir)
     os.remove(tmp_tar)
@@ -755,17 +623,29 @@ def _ensure_validation_labels(root: str):
     if not os.path.exists(cls_csv):
         logger.info(f"[Labels] Downloading {cls_csv}")
         _download(OI_URLS["classes_boxable"], cls_csv)
+
+
+def _ensure_train_labels(root: str):
+    """
+    Download official train detections CSV + class map to expected paths:
+      labels/detections/train-annotations-bbox.csv  (~2 GB)
+      labels/class-descriptions-boxable.csv
+    """
+    labels_dir = os.path.join(root, "labels")
+    det_dir = os.path.join(labels_dir, "detections")
+    _ensure_dir(det_dir)
+
+    det_csv = os.path.join(det_dir, "train-annotations-bbox.csv")
+    if not os.path.exists(det_csv):
+        logger.info("[Labels] Downloading train-annotations-bbox.csv (~2 GB) …")
+        _download(OI_URLS["train_boxes"], det_csv)
+
+    cls_csv = os.path.join(labels_dir, "class-descriptions-boxable.csv")
+    if not os.path.exists(cls_csv):
+        logger.info("[Labels] Downloading class-descriptions-boxable.csv …")
+        _download(OI_URLS["classes_boxable"], cls_csv)
         
         
-def _download_with_official_downloader(root: str, split: str, ids):
-    dl = os.path.join(tempfile.gettempdir(), "downloader.py")
-    if not os.path.exists(dl):
-        _run(["curl", "-L", "-o", dl, "https://raw.githubusercontent.com/openimages/dataset/master/downloader.py"])
-    idstxt = os.path.join(tempfile.gettempdir(), f"oi_{split}_ids.txt")
-    with open(idstxt, "w") as f:
-        for _id in ids:
-            f.write(_id if _id.startswith(f"{split}/") else f"{split}/{_id}\n")
-    _run([sys.executable, dl, idstxt, "--download_folder", os.path.join(root, "data"), "--num_processes", "8"])
 
 
 def _flatten_split_dir(split_dir: str, split: str) -> int:
@@ -846,14 +726,23 @@ def download_openimages(split="train",
         missing_ids = _find_missing_ids(split, split_dir, idset)
         logger.info(f"[{split}] After tar: Present={len(idset)-len(missing_ids)}  Missing={len(missing_ids)}")
 
+    if split == "train" and missing_ids and prefer_manual_images:
+        # Train has no single tarball; download missing images one-by-one via GCS HTTP
+        logger.info(f"[train] Downloading {len(missing_ids)} missing images via GCS HTTP (32 workers) …")
+        _download_missing_images_manual("train", split_dir, missing_ids)
+        missing_ids = _find_missing_ids(split, split_dir, idset)
+        logger.info(f"[train] After HTTP fetch: Present={len(idset)-len(missing_ids)}  Still missing={len(missing_ids)}")
+
     # final clean
     cleaned = _cleanup_bad_media(split, split_dir)
     if cleaned:
         logger.info(f"[{split}] Cleaned {cleaned} files under {split_dir}")
 
-    # 3) Labels: validation only (test has no detections)
+    # 3) Labels
     if split == "validation" and "detections" in set(label_types):
         _ensure_validation_labels(root)
+    if split == "train" and "detections" in set(label_types):
+        _ensure_train_labels(root)
 
     # 4) Load dataset
     if fo.dataset_exists(dataset_name):
@@ -905,9 +794,15 @@ def _ensure_prefixed_ids_file(root: str, split: str) -> str:
     with open(src_csv, "r", newline="", encoding="utf-8") as f, open(out_txt, "w") as g:
         r = csv.reader(f)
         header = next(r, None)
-        idx = 0 if not header or "ImageID" not in header else header.index("ImageID")
-        if header and "ImageID" not in header and header and len(header) > idx:
-            g.write(f"{split}/{header[idx].strip()}\n")
+        if not header:
+            return out_txt
+        if "ImageID" in header:
+            idx = header.index("ImageID")
+        else:
+            # headerless CSV: first column is the ID; first row was already consumed as header
+            idx = 0
+            if header[idx].strip():
+                g.write(f"{split}/{header[idx].strip()}\n")
         for row in r:
             if not row:
                 continue
@@ -919,6 +814,15 @@ def _ensure_prefixed_ids_file(root: str, split: str) -> str:
 def main():
     parser = build_myargparser()
     args = parser.parse_args()
+
+    # Fail fast if MongoDB isn't reachable before doing any real work
+    try:
+        get_db_client().server_info()
+        print("OK: FiftyOne is using external Mongo:", fo.config.database_uri)
+    except Exception as e:
+        print(f"[ERROR] Cannot reach MongoDB at {fo.config.database_uri}: {e}")
+        print("Start mongod on port 27100 first — see the docstring at the top of this file.")
+        sys.exit(1)
 
     if args.config_file:
         par_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -944,15 +848,14 @@ def main():
 
                 start_time = time.perf_counter()
 
-                # If needed:
-                # download_coco_2017_images(Path(image_path))
-                # download_lvis_annotations(Path(annotation_path))
+                download_coco_2017_images(Path(image_path))
+                download_lvis_annotations(Path(annotation_path))
 
                 download_dir = os.path.join(base_path, "open-images-v7")
                 os.makedirs(download_dir, exist_ok=True)
 
-                # 1. Train (USe Google storage) 
-                """download_openimages(split="train", label_types=("detections",), max_samples=None, download_dir=download_dir, prefer_manual_images=True )"""
+                # 1. Train
+                download_openimages(split="train", label_types=("detections",), max_samples=None, download_dir=download_dir, prefer_manual_images=True)
                 
                 # Validation (detections)
                 download_openimages(
@@ -983,8 +886,8 @@ def main():
     else:
         logger.info(f"---> PLEASE SPECIFY A VALID CONFIG JSON FILE VIA --config-file <---")
 
-    logger.info(f"""---> FINISHED [WORKFLOW: {os.getenv("RAPTOR_WORKFLOW_DOWNLOAD_DATA")}] "
-                f"FOR [MODULE: {os.getenv("RAPTOR_PROJECT_MODE")}] <---""")
+    logger.info(f"---> FINISHED [WORKFLOW: {os.getenv('RAPTOR_WORKFLOW_DOWNLOAD_DATA')}] "
+                f"FOR [MODULE: {os.getenv('RAPTOR_PROJECT_MODE')}] <---")
 
 if __name__ == '__main__':
     main()

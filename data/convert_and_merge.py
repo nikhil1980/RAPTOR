@@ -227,7 +227,7 @@ def main():
 
                 end_time = time.perf_counter()
                 logger.debug(f"---> DATASETS CONVERSION/EXPORT TO COCO JSON AND "
-                             f"MERGE DONE IN TIME {(end_time - start_time) / 60 * 60: .3f} HOURS <---")
+                             f"MERGE DONE IN TIME {(end_time - start_time) / (60 * 60): .3f} HOURS <---")
 
             except json.JSONDecodeError:
                 logger.exception(f"---> ERROR: INVALID JSON in {args.config_file} <---")
