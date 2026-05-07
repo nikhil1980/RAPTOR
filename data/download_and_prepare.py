@@ -126,6 +126,28 @@ def download_progress_hook(blocknum, blocksize, totalsize):
 
 
 # ---------- COCO ----------
+def _download_with_aria2(url: str, out_path: Path) -> bool:
+    if not shutil.which("aria2c"):
+        return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "aria2c",
+        "--continue=true",
+        "--max-connection-per-server=16",
+        "--split=16",
+        "--min-split-size=1M",
+        "--max-tries=0",           # retry forever
+        "--retry-wait=5",
+        "--timeout=60",
+        "--dir", str(out_path.parent),
+        "--out", out_path.name,
+        url,
+    ]
+    print(f"[aria2c] {url}")
+    ret = subprocess.run(cmd).returncode
+    return ret == 0
+
+
 def download_coco_2017_images(dst: Path):
     """
     Downloads and extracts COCO 2017 train and val images to the specified directory.
@@ -137,17 +159,22 @@ def download_coco_2017_images(dst: Path):
         "val2017":   "http://images.cocodataset.org/zips/val2017.zip",
     }
     for split, url in coco_urls.items():
-        zpath = dst/f"{split}.zip"
-        if not zpath.exists():
-            logger.debug(f"---> [COCO] downloading {split} ...<---")
-            _stream_download(url, zpath)
-        outdir = dst/split
+        zpath = dst / f"{split}.zip"
+        outdir = dst / split
         outdir.mkdir(exist_ok=True)
-        if not any(outdir.iterdir()):
-            logger.debug(f"--> [COCO] extracting {zpath} ... <---")
-            with zipfile.ZipFile(zpath,"r") as zf: zf.extractall(dst)
-        if zpath.exists():
-            os.remove(zpath)
+        if any(outdir.iterdir()):
+            logger.debug(f"---> [COCO] {split} already extracted, skipping <---")
+            if zpath.exists():
+                os.remove(zpath)
+            continue
+        logger.debug(f"---> [COCO] downloading {split} ...<---")
+        if not _download_with_aria2(url, zpath):
+            # fallback: resumable Python download
+            _stream_download(url, zpath)
+        logger.debug(f"--> [COCO] extracting {zpath} ... <---")
+        with zipfile.ZipFile(zpath, "r") as zf:
+            zf.extractall(dst)
+        os.remove(zpath)
     logger.debug(f"---> [COCO] 2017 images ready at {dst} <---")
 
 
@@ -167,28 +194,37 @@ def _http_session():
     return s
 
 
-def _stream_download(url: str, out_path: Path, chunk=1 << 20):
-    """
-    Stream download a file from a URL to a local path with progress reporting.
-    
-    :param url: The URL to download from.
-    :param out_path: The local file path to save the downloaded file.
-    :param chunk: The size of each chunk to read from the response.
-    :return: None"""
+def _stream_download(url: str, out_path: Path, chunk=1 << 20, max_retries=20):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with _http_session().get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", "0") or "0")
-        downloaded = 0
-        with open(out_path, "wb") as f:
-            for part in r.iter_content(chunk_size=chunk):
-                if part:
-                    f.write(part)
-                    downloaded += len(part)
-                    if total:
-                        pct = 100.0 * downloaded / total
-                        print(f"\r[DL] {out_path.name}: {downloaded/1e6:.1f}/{total/1e6:.1f} MB ({pct:.1f}%)", end="")
-        print()
+    for attempt in range(max_retries):
+        offset = out_path.stat().st_size if out_path.exists() else 0
+        headers = {"Range": f"bytes={offset}-"} if offset > 0 else {}
+        try:
+            with _http_session().get(url, stream=True, timeout=(30, 300), headers=headers) as r:
+                if r.status_code == 416:
+                    print(f"[DL] {out_path.name}: already complete")
+                    return
+                r.raise_for_status()
+                total_remaining = int(r.headers.get("Content-Length", "0") or "0")
+                total = offset + total_remaining
+                downloaded = offset
+                mode = "ab" if offset > 0 else "wb"
+                with open(out_path, mode) as f:
+                    for part in r.iter_content(chunk_size=chunk):
+                        if part:
+                            f.write(part)
+                            f.flush()
+                            downloaded += len(part)
+                            if total:
+                                pct = 100.0 * downloaded / total
+                                print(f"\r[DL] {out_path.name}: {downloaded/1e6:.1f}/{total/1e6:.1f} MB ({pct:.1f}%)", end="", flush=True)
+            print()
+            return
+        except Exception as e:
+            wait = min(2 ** attempt, 120)
+            print(f"\n[RETRY {attempt+1}/{max_retries}] {out_path.name} @ {offset/1e6:.0f} MB — {e} — retrying in {wait}s")
+            time.sleep(wait)
+    raise RuntimeError(f"Failed to download {url} after {max_retries} retries")
 
 
 
@@ -486,11 +522,18 @@ OI_IMG_URL = {
 }
 
 
-# ---------- AWS CVDF tar (validation/test) helpers for OPENIMAGES v7 ----------
+# ---------- AWS CVDF tar helpers for OPENIMAGES v7 ----------
 S3_TARS = {
     "validation": "s3://open-images-dataset/tar/validation.tar.gz",
     "test":       "s3://open-images-dataset/tar/test.tar.gz",
 }
+
+# Train is sharded into 16 tarballs, one per first hex digit of the image ID.
+# Each ~10-15 GB compressed; ~108 K images per shard.
+OI_TRAIN_TARS = [
+    f"s3://open-images-dataset/tar/train_{d}.tar.gz"
+    for d in "0123456789abcdef"
+]
 
 
 def _download_missing_images_manual(split: str, 
@@ -589,20 +632,96 @@ def _fetch_split_tar_to(split: str, split_dir: str):
     """
     Download split tar.gz from CVDF (no auth) and extract into data/{split}/
     with the top-level 'split/' folder stripped.
+    Uses aria2c (16 connections) when available, then curl, then aws-cli.
     """
     url = S3_TARS[split]
+    https_url = url.replace("s3://open-images-dataset/", "https://open-images-dataset.s3.amazonaws.com/")
     tmp_tar = os.path.join(tempfile.gettempdir(), f"openimages_{split}.tar.gz")
     os.makedirs(split_dir, exist_ok=True)
 
     if _has_awscli():
         _run(["aws", "s3", "--no-sign-request", "cp", url, tmp_tar])
-    else:
-        # S3 URIs can't be used with curl; map to the public HTTPS endpoint
-        https_url = url.replace("s3://open-images-dataset/", "https://open-images-dataset.s3.amazonaws.com/")
-        _run(["curl", "-L", "-o", tmp_tar, https_url])
+    elif not _download_with_aria2(https_url, Path(tmp_tar)):
+        _run(["curl", "-L", "-C", "-", "-o", tmp_tar, https_url])
 
     _tar_extract_strip1(tmp_tar, split_dir)
     os.remove(tmp_tar)
+
+
+def _fetch_train_tars_parallel(split_dir: str, tar_workers: int = 4) -> None:
+    """
+    Download and extract all 16 OI train tarballs in parallel.
+    Each shard covers images whose ID starts with one hex digit (0-f).
+    Uses aria2c (16 connections/file) when available, otherwise curl.
+    tar_workers controls how many tarballs are downloaded simultaneously.
+    """
+    def _one_shard(s3_url: str) -> None:
+        fname  = os.path.basename(s3_url)              # train_0.tar.gz
+        https  = s3_url.replace("s3://open-images-dataset/",
+                                "https://open-images-dataset.s3.amazonaws.com/")
+        tmp    = os.path.join(tempfile.gettempdir(), fname)
+        digit  = fname[len("train_"):-len(".tar.gz")]  # "0" … "f"
+        logger.info(f"---> [OI-TRAIN] Starting shard train_{digit} <---")
+        try:
+            ok = False
+
+            # 1. Try aws-cli (shows --no-progress so output stays clean in logs)
+            if _has_awscli():
+                try:
+                    _run(["aws", "s3", "--no-sign-request", "--no-progress",
+                          "cp", s3_url, tmp])
+                    ok = True
+                except Exception as aws_err:
+                    logger.warning(f"---> [OI-TRAIN] aws-cli failed for train_{digit} "
+                                   f"({aws_err}), falling back to aria2c <---")
+
+            # 2. Fallback: aria2c (log-friendly: no escape codes, 60 s summaries)
+            if not ok and shutil.which("aria2c"):
+                cmd = [
+                    "aria2c",
+                    "--continue=true",
+                    "--max-connection-per-server=16",
+                    "--split=16",
+                    "--min-split-size=1M",
+                    "--max-tries=5",
+                    "--retry-wait=10",
+                    "--timeout=120",
+                    "--console-log-level=warn",
+                    "--summary-interval=60",
+                    "--dir", tempfile.gettempdir(),
+                    "--out", fname,
+                    https,
+                ]
+                ret = subprocess.run(cmd).returncode
+                ok = (ret == 0)
+
+            # 3. Last resort: curl with resume support
+            if not ok:
+                _run(["curl", "-L", "-C", "-", "-o", tmp, https])
+                ok = True
+
+            logger.info(f"---> [OI-TRAIN] Extracting shard train_{digit} <---")
+            _tar_extract_strip1(tmp, split_dir)
+            logger.info(f"---> [OI-TRAIN] Shard train_{digit} done <---")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    logger.info(f"---> [OI-TRAIN] Downloading {len(OI_TRAIN_TARS)} train shards "
+                f"({tar_workers} parallel) via CVDF <---")
+    failed = []
+    with ThreadPoolExecutor(max_workers=tar_workers) as ex:
+        futs = {ex.submit(_one_shard, u): u for u in OI_TRAIN_TARS}
+        for fut in as_completed(futs):
+            try:
+                fut.result()
+            except Exception as e:
+                url = futs[fut]
+                logger.error(f"---> [OI-TRAIN] FAILED {url}: {e} <---")
+                failed.append(url)
+    if failed:
+        logger.warning(f"---> [OI-TRAIN] {len(failed)} shards failed — "
+                       "remaining images will be fetched individually <---")
     
 
 def _ensure_validation_labels(root: str):
@@ -728,11 +847,21 @@ def download_openimages(split="train",
         logger.info(f"[{split}] After tar: Present={len(idset)-len(missing_ids)}  Missing={len(missing_ids)}")
 
     if split == "train" and missing_ids and prefer_manual_images:
-        # Train has no single tarball; download missing images one-by-one via GCS HTTP
-        logger.info(f"[train] Downloading {len(missing_ids)} missing images via GCS HTTP (32 workers) …")
-        _download_missing_images_manual("train", split_dir, missing_ids)
-        missing_ids = _find_missing_ids(split, split_dir, idset)
-        logger.info(f"[train] After HTTP fetch: Present={len(idset)-len(missing_ids)}  Still missing={len(missing_ids)}")
+        if len(missing_ids) > 10_000:
+            # Bulk: 16 CVDF tarballs in parallel (aria2c per shard when available)
+            _fetch_train_tars_parallel(split_dir)
+            _flatten_split_dir(split_dir, split)
+            missing_ids = _find_missing_ids(split, split_dir, idset)
+            logger.info(f"---> [OI-TRAIN] After tarballs: "
+                        f"Present={len(idset)-len(missing_ids)}  Missing={len(missing_ids)} <---")
+        # Pick up any images not covered by tarballs (or if tarballs failed)
+        if missing_ids:
+            logger.info(f"---> [OI-TRAIN] HTTP-fetching {len(missing_ids)} remaining images "
+                        f"(32 workers) <---")
+            _download_missing_images_manual("train", split_dir, missing_ids)
+            missing_ids = _find_missing_ids(split, split_dir, idset)
+            logger.info(f"---> [OI-TRAIN] After HTTP fetch: "
+                        f"Present={len(idset)-len(missing_ids)}  Still missing={len(missing_ids)} <---")
 
     # final clean
     cleaned = _cleanup_bad_media(split, split_dir)
