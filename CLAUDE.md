@@ -46,7 +46,29 @@ huggingface-cli login  # Required: accept DINOv3 license gate
 - Training uses HF `Trainer` with fp16, gradient accumulation (4 steps), cosine LR; W&B is gated on `RAPTOR_WANDB_PROJECT_ENABLED`
 
 ### Pre-training smoke test (`train/smoke_test.py`)
-**Always run before launching a long training run.** Validates: dataset/processor build, model assembly, DINOv3 body fully frozen, FPN produces correct stride-8/16/32 shapes, gradients reach the OV head and FPN but NOT the body, the model can overfit a single batch >50% in 80 steps (the single best predictor of "training will learn"), eval forward pass is finite, sampler weights are non-uniform. Fails fast and loud — first failed assertion exits non-zero.
+**Always run before launching a long training run.** Validates: dataset/processor build, model assembly, DINOv3 body fully frozen, FPN produces correct stride-8/16/32 shapes, gradients reach the OV head and FPN but NOT the body, the model can overfit a single batch >50% in 300 steps (the single best predictor of "training will learn"), eval forward pass is finite, sampler weights are non-uniform. Fails fast and loud — first failed assertion exits non-zero.
+
+### W&B logging callbacks (`train/wandb_callbacks.py`)
+Four `TrainerCallback` classes attached automatically when `RAPTOR_WANDB_PROJECT_ENABLED` is on:
+- `PeriodicCOCOEvalCallback` — full COCO mAP every epoch on val (`val/coco/map`, `map_50`, `map_75`, `map_small/medium/large`, `ap_rare/common/frequent`). Stores history for end-of-run plots.
+- `SamplePredictionsCallback` — every 2 epochs, runs inference on a fixed pool of 8 val images and logs annotated PIL images to W&B for qualitative inspection.
+- `BackboneUnfreezeCallback` — at 80% of `num_train_epochs`, unfreezes the last 2 DINOv3 blocks at 0.1× LR by adding them to the existing optimizer.
+- `EndOfRunArtifactsCallback` — on train end, uploads the `final/` model directory as a versioned W&B Artifact, plus tables for mAP-history, top/bottom-50 per-class AP, AP-by-frequency-slice, and top-30 most-confused class pairs.
+
+### Tunable env knobs (training)
+| Env var | Default | What it controls |
+|---------|---------|------------------|
+| `RAPTOR_TRAIN_BF16` | `true` | Use bf16 instead of fp16 (auto-falls-back to fp16 if GPU lacks bf16). RT-DETR's focal/VFL is unstable in fp16. |
+| `RAPTOR_TRAIN_METRIC_FOR_BEST` | `eval_loss` | Metric driving best-checkpoint selection. Set to `eval_val/coco/map` once mAP is logged. |
+| `RAPTOR_TRAIN_GREATER_IS_BETTER` | `false` | Pair with the metric — `true` for mAP, `false` for loss. |
+| `RAPTOR_TRAIN_SAVE_TOTAL_LIMIT` | `3` | Keep at most this many checkpoints on disk. |
+| `RAPTOR_EVAL_BATCH_SIZE` | `8` | Inference batch size for the periodic COCO eval. |
+| `RAPTOR_EVAL_SCORE_THRESH` | `0.05` | Min score for a detection to be counted in COCO eval. |
+| `RAPTOR_WANDB_SAMPLE_PREDS_EVERY` | `2` | Epoch cadence for sample-prediction visualizations. |
+| `RAPTOR_WANDB_NUM_SAMPLE_PREDS` | `8` | How many fixed val images to visualize each time. |
+| `RAPTOR_UNFREEZE_BACKBONE_FRAC` | `0.8` | Fraction of total epochs after which to unfreeze the last N DINOv3 blocks. Set `>=1.0` to disable. |
+| `RAPTOR_UNFREEZE_BACKBONE_BLOCKS` | `2` | Number of last transformer blocks to unfreeze. |
+| `RAPTOR_UNFREEZE_BACKBONE_LR_MULT` | `0.1` | LR multiplier for unfrozen backbone params (relative to `RAPTOR_TRAIN_LEARNING_RATE`). |
 
 ### Data Pipeline (`data/`)
 - `download_and_prepare.py`: Downloads COCO, LVIS, OpenImages-V7 via FiftyOne

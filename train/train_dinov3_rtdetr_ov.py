@@ -1,4 +1,8 @@
-import os, json, math
+import os, sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import json, math
 import time
 from pathlib import Path
 from collections import defaultdict
@@ -36,6 +40,11 @@ Training script for DINOv3 + RTDETR on custom MoD (mixture of data).
 @license: Apache-2.0
 @description: This script fine-tunes the RTDETR model with a DINOv3 backbone on a MoD.
 @copyright: Copyright 2025 Nikhil Bhargava
+
+To run:
+export RAPTOR_WANDB_PROJECT="raptor-dinov3-rtdetr"
+export RAPTOR_WANDB_RUN_NAME="full-50ep-bf16-unfreeze80pct"                             
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python train/train_dinov3_rtdetr_ov.py --config-file config.json
 """
 
 logger = get_logger(__name__)
@@ -146,8 +155,11 @@ class CocoDetDataset(Dataset):
             size=Config.IMAGE_SIZE,
         )
         processed["pixel_values"] = processed["pixel_values"].squeeze(0)
-        processed["labels"] = [{k: v.squeeze(0) if isinstance(v, torch.Tensor) else v
-                                for k,v in processed["labels"][0].items()}]
+        # Do NOT squeeze label tensors. The processor returns boxes as (N, 4),
+        # class_labels as (N,), area as (N,), etc. — already without a batch dim.
+        # Squeezing collapsed (1, 4) -> (4,) for single-annotation images and
+        # broke downstream `boxes[:, 0]` indexing.
+        processed["labels"] = [processed["labels"][0]]
 
         # Letterbox-style resize keeps aspect ratio but yields variable (H, W).
         # Pad bottom-right to a fixed square so collate can stack the batch,
@@ -790,7 +802,7 @@ class LongTailTrainer(Trainer):
             pin_memory=True
         )
 
-    def compute_loss(self, model, inputs, return_outputs=False)-> torch.Tensor:
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs)-> torch.Tensor:
         """
         Compute loss for the model.
 
@@ -821,10 +833,34 @@ def train():
 
     :return: None
     """
+    from train.wandb_callbacks import (
+        SamplePredictionsCallback,
+        PeriodicCOCOEvalCallback,
+        BackboneUnfreezeCallback,
+        EndOfRunArtifactsCallback,
+    )
+
     wandb_enabled = os.getenv("RAPTOR_WANDB_PROJECT_ENABLED", "true").lower() in ("true", "1", "yes")
     if wandb_enabled:
-        wandb.init(project=os.getenv("RAPTOR_WANDB_PROJECT", "dinov3_lvis_oi_rtdetr"),
-               name=os.getenv("RAPTOR_WANDB_RUN_NAME", "focal_vfl_classaware"))
+        wandb.init(
+            project=os.getenv("RAPTOR_WANDB_PROJECT", "dinov3_lvis_oi_rtdetr"),
+            name=os.getenv("RAPTOR_WANDB_RUN_NAME", "focal_vfl_classaware"),
+            config={
+                "backbone":               Config.PRETRAINED_BACKBONE,
+                "text_encoder":           Config.TEXT_ENCODER,
+                "image_size":             Config.IMAGE_SIZE,
+                "freeze_backbone":        Config.FREEZE_BACKBONE,
+                "use_ov_head":            Config.USE_OV_HEAD,
+                "focal_alpha":            Config.FOREGROUND_ALPHA,
+                "focal_gamma":            Config.FOCAL_GAMMA,
+                "vfl_weight":             Config.VFL_WEIGHT,
+                "eos_coef":               Config.EOS_COEF,
+                "ov_alpha":               LossConfig.ov_alpha,
+                "ov_gamma":               LossConfig.ov_gamma,
+                "ov_weight":              LossConfig.ov_weight,
+            },
+            tags=["dinov3", "rt-detr", "ov-head", "long-tail"],
+        )
 
     image_processor, train_ds, val_ds, id2label, label2id = build_processor_and_datasets()
     model = build_model(len(id2label),
@@ -833,23 +869,69 @@ def train():
                         device=Config.DEVICE
                         )
     model_dir = os.path.join(BASE_PATH, os.getenv("RAPTOR_PATHS_MODEL_DIR", "runs/dinov3_rtdetr"))
+
+    # Prefer bf16 over fp16 — RT-DETR's focal/VFL is known to NaN in fp16.
+    bf16_supported = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_bf16 = bf16_supported and os.getenv("RAPTOR_TRAIN_BF16", "true").lower() in ("true", "1", "yes")
+    use_fp16 = (not use_bf16) and torch.cuda.is_available()
+
     args = TrainingArguments(
         output_dir=model_dir,
-        per_device_train_batch_size=int(os.getenv("RAPTOR_TRAIN_BATCH_SIZE", 2)),
-        per_device_eval_batch_size=int(os.getenv("RAPTOR_TRAIN_VAL_BATCH_SIZE", 2)),
-        gradient_accumulation_steps=int(os.getenv("RAPTOR_TRAIN_ACCUM_STEPS", 4)),
-        learning_rate=float(os.getenv("RAPTOR_TRAIN_LEARNING_RATE", 2e-4)),
-        num_train_epochs=int(os.getenv("RAPTOR_TRAIN_EPOCHS", 50)),
+        per_device_train_batch_size=int(os.getenv("RAPTOR_TRAIN_BATCH_SIZE", "2")),
+        per_device_eval_batch_size=int(os.getenv("RAPTOR_TRAIN_VAL_BATCH_SIZE", "2")),
+        gradient_accumulation_steps=int(os.getenv("RAPTOR_TRAIN_ACCUM_STEPS", "4")),
+        learning_rate=float(os.getenv("RAPTOR_TRAIN_LEARNING_RATE", "2e-4")),
+        num_train_epochs=int(os.getenv("RAPTOR_TRAIN_EPOCHS", "50")),
         lr_scheduler_type=os.getenv("RAPTOR_TRAIN_LR_SCHEDULER_TYPE", "cosine"),
-        warmup_ratio=float(os.getenv("RAPTOR_TRAIN_WARMUP_RATIO", 0.05)),
-        weight_decay=float(os.getenv("RAPTOR_TRAIN_WEIGHT_DECAY", 0.05)),
-        logging_steps=int(os.getenv("RAPTOR_TRAIN_LOGGING_STEPS", 50)),
+        warmup_ratio=float(os.getenv("RAPTOR_TRAIN_WARMUP_RATIO", "0.05")),
+        weight_decay=float(os.getenv("RAPTOR_TRAIN_WEIGHT_DECAY", "0.05")),
+        logging_steps=int(os.getenv("RAPTOR_TRAIN_LOGGING_STEPS", "25")),
         eval_strategy="epoch",
         save_strategy="epoch",
-        fp16=torch.cuda.is_available(),
-        dataloader_num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", 4)),
+        save_total_limit=int(os.getenv("RAPTOR_TRAIN_SAVE_TOTAL_LIMIT", "3")),
+        load_best_model_at_end=True,
+        metric_for_best_model=os.getenv("RAPTOR_TRAIN_METRIC_FOR_BEST", "eval_loss"),
+        greater_is_better=os.getenv("RAPTOR_TRAIN_GREATER_IS_BETTER", "false").lower() == "true",
+        bf16=use_bf16,
+        fp16=use_fp16,
+        max_grad_norm=float(os.getenv("RAPTOR_TRAIN_MAX_GRAD_NORM", "1.0")),
+        dataloader_num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", "4")),
         report_to=["wandb"] if wandb_enabled else [],
+        run_name=os.getenv("RAPTOR_WANDB_RUN_NAME", "focal_vfl_classaware"),
     )
+    logger.info(f"---> precision: {'bf16' if use_bf16 else 'fp16' if use_fp16 else 'fp32'} <---")
+
+    # Build callbacks (only attach W&B-dependent ones if wandb is on).
+    callbacks = []
+    if wandb_enabled:
+        periodic_eval = PeriodicCOCOEvalCallback(
+            val_ds=val_ds,
+            image_processor=image_processor,
+            id2label=id2label,
+            batch_size=int(os.getenv("RAPTOR_EVAL_BATCH_SIZE", "8")),
+            score_thresh=float(os.getenv("RAPTOR_EVAL_SCORE_THRESH", "0.05")),
+            num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", "4")),
+        )
+        sample_preds = SamplePredictionsCallback(
+            val_ds=val_ds,
+            image_processor=image_processor,
+            id2label=id2label,
+            every_n_epochs=int(os.getenv("RAPTOR_WANDB_SAMPLE_PREDS_EVERY", "2")),
+            num_samples=int(os.getenv("RAPTOR_WANDB_NUM_SAMPLE_PREDS", "8")),
+        )
+        end_artifacts = EndOfRunArtifactsCallback(
+            model_dir=model_dir,
+            periodic_eval=periodic_eval,
+        )
+        callbacks.extend([periodic_eval, sample_preds, end_artifacts])
+
+    # Backbone unfreeze is independent of W&B — always include if Config.FREEZE_BACKBONE.
+    if Config.FREEZE_BACKBONE and float(os.getenv("RAPTOR_UNFREEZE_BACKBONE_FRAC", "0.8")) < 1.0:
+        callbacks.append(BackboneUnfreezeCallback(
+            frac_of_total=float(os.getenv("RAPTOR_UNFREEZE_BACKBONE_FRAC", "0.8")),
+            num_blocks=int(os.getenv("RAPTOR_UNFREEZE_BACKBONE_BLOCKS", "2")),
+            lr_multiplier=float(os.getenv("RAPTOR_UNFREEZE_BACKBONE_LR_MULT", "0.1")),
+        ))
 
     trainer = LongTailTrainer(
         image_processor=image_processor,
@@ -858,6 +940,7 @@ def train():
         args=args,
         data_collator=collate_fn,
         eval_dataset=val_ds,
+        callbacks=callbacks,
     )
     trainer.train()
     save_dir = os.path.join(model_dir, "final")
