@@ -32,6 +32,10 @@ class Config:
     NUM_WORKERS = 8
     
     PRETRAINED_BACKBONE = "facebook/dinov3-vitb16-pretrain-lvd1689m"  # accept license
+
+    # TODO Replace once I getthe permission to use the model
+    #PRETRAINED_BACKBONE = "facebook/dinov2-with-registers-base"
+
     RTDETR_IMAGE_PROCESSOR = "PekingU/rtdetr_r50vd"
     TEXT_ENCODER = "google/siglip-so400m-patch14-384"
     CLIP_MODEL =  "ViT-L-14"

@@ -9,7 +9,7 @@ To briefly summarize, RAPTOR is a NMS-free, real-time detection with DINOv3 feat
 RAPTOR has following features:
 
 ### 1. Backbone ###
-DINOv3 (teacher–student Semi Supervised Learning or SSL with Gram anchoring) as a Hugging Face Backbone.
+DINOv3 (teacher–student Semi Supervised Learning or SSL with Gram anchoring) as a Hugging Face Backbone, wrapped in a small ViTDet-style FPN adapter (`DinoV3FPNBackbone`) that synthesizes the stride-8 / stride-16 / stride-32 feature maps RT-DETR's HybridEncoder expects from DINOv3 ViT's single stride-16 output.
 
 ### 2. Head ###
 It uses RT-DETR head. So, it is a $\int$(hybrid encoder , query selection) and this makes it Non-Maximal-Selection free!
@@ -88,10 +88,15 @@ datasets/mixture/
       instances_{train,val}_merged.json   # <- used by training/eval
 ```
 
-3. Train RAPTOR with focal/VFL + class-aware sampling + OV focal head.
+3. Smoke-test the full pipeline before burning GPU hours. This builds the model, asserts the DINOv3 body is frozen, checks the FPN produces stride-8/16/32 feature maps, verifies gradients flow into the OV head and FPN (but NOT the body), and overfits a single batch >50% in 80 steps. If this fails, do **not** launch a full run.
+```
+python train/smoke_test.py --config-file config.json
+```
+
+4. Train RAPTOR with focal/VFL + class-aware sampling + OV focal head.
 ```
 export WANDB_PROJECT=<NAME YOUR PROJECT>
-python train/train_dinov3_rtdetr_ov.py
+python train/train_dinov3_rtdetr_ov.py --config-file config.json
 ```
 
 At the end, you'll get the following:
@@ -101,7 +106,7 @@ At the end, you'll get the following:
  * Optional OV head with focal-BCE on text matches
  * W&B logs with final weights at ```../runs/dinov3_rtdetr/final/``` 
  
-4. Evaluate RAPTOR via COCO mAP, LVIS APr/APc/APf, PR plots
+5. Evaluate RAPTOR via COCO mAP, LVIS APr/APc/APf, PR plots
 ```
 python eval/eval_and_infer.py
 ```
@@ -111,12 +116,12 @@ This gives the following output:
  * PR curves saved per sampled class
  * Optional LVIS breakdown (```APr/APc/APf```) via ```lvis_eval()``` call
    
-5. Inference over single image via Open-Vocabulary Prompting:
+6. Inference over single image via Open-Vocabulary Prompting:
 ```
 python eval/zero_shot_prompt.py
 ```
 
-6. Production Inference over union of closed + open labels:
+7. Production Inference over union of closed + open labels:
 ```
 python serve/infer_cli.py --image path/to/image.jpg \
   --lexicon resources/open_vocab_lexicon.txt \

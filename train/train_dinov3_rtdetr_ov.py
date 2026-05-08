@@ -1,8 +1,8 @@
 import os, json, math
 import time
 from pathlib import Path
-from Collections import defaultdict
-from typing import Any, Dict, List
+from collections import defaultdict
+from typing import Any, Dict, List, Tuple
 
 import torch, torch.nn as nn
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -16,9 +16,10 @@ from transformers import (
     TrainingArguments
 )
 from transformers.utils import logging
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, SiglipTextModel
 import wandb
 from pycocotools.coco import COCO
+from scipy.optimize import linear_sum_assignment
 """ System Modules """
 
 from common.env import load_env_from_json
@@ -147,10 +148,34 @@ class CocoDetDataset(Dataset):
         processed["pixel_values"] = processed["pixel_values"].squeeze(0)
         processed["labels"] = [{k: v.squeeze(0) if isinstance(v, torch.Tensor) else v
                                 for k,v in processed["labels"][0].items()}]
+
+        # Letterbox-style resize keeps aspect ratio but yields variable (H, W).
+        # Pad bottom-right to a fixed square so collate can stack the batch,
+        # and rescale normalized cxcywh boxes from (H, W) basis to (S, S) basis.
+        target_size = Config.IMAGE_SIZE.get(
+            "longest_edge",
+            Config.IMAGE_SIZE.get("height", 640),
+        )
+        pv = processed["pixel_values"]  # (3, H, W)
+        H, W = pv.shape[-2], pv.shape[-1]
+        if H != target_size or W != target_size:
+            padded = torch.zeros(pv.shape[0], target_size, target_size, dtype=pv.dtype)
+            padded[:, :H, :W] = pv
+            processed["pixel_values"] = padded
+            lab = dict(processed["labels"][0])
+            if "boxes" in lab and lab["boxes"].numel() > 0:
+                sx, sy = W / target_size, H / target_size
+                boxes = lab["boxes"].clone()
+                boxes[:, 0] *= sx  # cx
+                boxes[:, 1] *= sy  # cy
+                boxes[:, 2] *= sx  # w
+                boxes[:, 3] *= sy  # h
+                lab["boxes"] = boxes
+            processed["labels"] = [lab]
         return processed
 
 
-def build_idmaps(coco_json: Path) -> (Dict[int,str], Dict[str,int]):
+def build_idmaps(coco_json: Path) -> Tuple[Dict[int,str], Dict[str,int]]:
     """
     Build ID to label and label to ID mappings from COCO annotations JSON.
 
@@ -170,6 +195,73 @@ def build_idmaps(coco_json: Path) -> (Dict[int,str], Dict[str,int]):
     id2label = {c["id"]: c["name"] for c in cats}
     label2id = {v:k for k,v in id2label.items()}
     return id2label, label2id
+
+
+# --------- DINOv3 ViT -> multi-scale (ViTDet-style FPN) ----------
+class DinoV3FPNBackbone(nn.Module):
+    """
+    ViTDet-style multi-scale adapter for DINOv3 ViT.
+
+    DINOv3 ViT outputs a single stride-16 feature map. RT-DETR's HybridEncoder
+    needs three feature maps at strides 8 / 16 / 32. We synthesize them from
+    the last block's patch tokens with:
+        - stride 8:  ConvTranspose2d 2x  (upsample)
+        - stride 16: 1x1 Conv            (channel projection)
+        - stride 32: stride-2 3x3 Conv   (downsample)
+
+    Exposes the interface RTDetrModel expects from its `backbone`:
+        - forward(pixel_values, pixel_mask) -> List[(features, mask)]
+        - .intermediate_channel_sizes attribute
+    """
+    def __init__(self, backbone_name: str, out_channels: List[int], freeze: bool = True):
+        super().__init__()
+        from transformers import AutoModel
+        self.body = AutoModel.from_pretrained(backbone_name)
+        if freeze:
+            for p in self.body.parameters():
+                p.requires_grad_(False)
+            self.body.eval()
+        cfg = self.body.config
+        self.patch_size = cfg.patch_size
+        c_in = cfg.hidden_size
+        c8, c16, c32 = out_channels
+
+        self.lat8 = nn.Sequential(
+            nn.ConvTranspose2d(c_in, c8, kernel_size=2, stride=2),
+            nn.GroupNorm(32, c8),
+        )
+        self.lat16 = nn.Sequential(
+            nn.Conv2d(c_in, c16, kernel_size=1),
+            nn.GroupNorm(32, c16),
+        )
+        self.lat32 = nn.Sequential(
+            nn.Conv2d(c_in, c32, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(32, c32),
+        )
+        self.intermediate_channel_sizes = list(out_channels)
+
+    def forward(self, pixel_values: torch.Tensor, pixel_mask: torch.Tensor = None):
+        B, _, H, W = pixel_values.shape
+        Hp, Wp = H // self.patch_size, W // self.patch_size
+        N = Hp * Wp
+        out = self.body(pixel_values=pixel_values)
+        last = out.last_hidden_state                    # [B, special+N, C]
+        patches = last[:, -N:, :]                       # patch tokens are last
+        feat = patches.transpose(1, 2).reshape(B, -1, Hp, Wp)
+
+        f8 = self.lat8(feat)
+        f16 = self.lat16(feat)
+        f32 = self.lat32(feat)
+
+        if pixel_mask is None:
+            pixel_mask = torch.ones((B, H, W), device=pixel_values.device, dtype=torch.bool)
+        feats_and_masks = []
+        for f in (f8, f16, f32):
+            m = nn.functional.interpolate(
+                pixel_mask[None].float(), size=f.shape[-2:], mode="nearest"
+            ).to(torch.bool)[0]
+            feats_and_masks.append((f, m))
+        return feats_and_masks
 
 
 # --------- OV head + focal BCE ----------
@@ -290,15 +382,105 @@ def build_text_embeddings(class_names: List[str], device) -> torch.Tensor:
     :rtype: torch.Tensor
     """
     tok = AutoTokenizer.from_pretrained(Config.TEXT_ENCODER)
-    txtm = AutoModel.from_pretrained(Config.TEXT_ENCODER).to(device).eval()
-    outs = []
+    txtm = SiglipTextModel.from_pretrained(Config.TEXT_ENCODER).to(device).eval()
+    prompts = [f"a photo of a {name}" for name in class_names]
     with torch.no_grad():
-        for name in class_names:
-            prompt = f"a photo of a {name}"
-            out = txtm(**tok(prompt, return_tensors="pt").to(device))
-            emb = out.text_embeds if hasattr(out, "text_embeds") and out.text_embeds is not None else out.last_hidden_state[:,0]
-            outs.append(emb[0])
-    return torch.stack(outs, dim=0)  # [T, D]
+        inputs = tok(prompts, return_tensors="pt", padding="max_length", truncation=True).to(device)
+        out = txtm(**inputs)
+        # SigLIP pools the last (EOS-equivalent) token; fall back to it if the
+        # checkpoint exposes no pooler_output.
+        embs = out.pooler_output if out.pooler_output is not None else out.last_hidden_state[:, -1]
+    embs = embs.detach().clone()
+    del txtm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return embs
+
+
+# --------- Self-contained Hungarian matcher ----------
+# Avoids depending on transformers.models.rt_detr internals — the matcher
+# class has moved across HF releases (modeling_rt_detr -> loss_rt_detr -> ...).
+def _box_cxcywh_to_xyxy(b: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = b.unbind(-1)
+    return torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], dim=-1)
+
+
+def _pairwise_giou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Both inputs in xyxy. Returns GIoU matrix [N, M]."""
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    inter = (rb - lt).clamp(min=0).prod(-1)
+    union = area1[:, None] + area2[None, :] - inter
+    iou = inter / union.clamp(min=1e-6)
+    lt_e = torch.min(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb_e = torch.max(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    enc = (rb_e - lt_e).clamp(min=0).prod(-1)
+    return iou - (enc - union) / enc.clamp(min=1e-6)
+
+
+class RAPTORHungarianMatcher(nn.Module):
+    """
+    Hungarian matcher for RT-DETR style outputs (focal classification cost
+    + L1 box cost + GIoU box cost). Boxes are normalized cxcywh.
+    """
+    def __init__(self,
+                 class_cost: float = 2.0,
+                 bbox_cost: float = 5.0,
+                 giou_cost: float = 2.0,
+                 alpha: float = 0.25,
+                 gamma: float = 2.0):
+        super().__init__()
+        self.class_cost = class_cost
+        self.bbox_cost = bbox_cost
+        self.giou_cost = giou_cost
+        self.alpha = alpha
+        self.gamma = gamma
+
+    @torch.no_grad()
+    def forward(self, outputs: Dict[str, torch.Tensor], targets: List[Dict[str, torch.Tensor]]):
+        bs, nq = outputs["logits"].shape[:2]
+        out_prob = outputs["logits"].flatten(0, 1).sigmoid()        # [B*Q, K]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1).float()       # [B*Q, 4]
+
+        sizes = [int(t["class_labels"].numel()) for t in targets]
+        device = out_bbox.device
+        if sum(sizes) == 0:
+            empty = (torch.empty(0, dtype=torch.long, device=device),
+                     torch.empty(0, dtype=torch.long, device=device))
+            return [empty for _ in range(bs)]
+
+        tgt_ids = torch.cat([t["class_labels"] for t in targets]).long()
+        tgt_bbox = torch.cat([t["boxes"] for t in targets]).float()
+
+        eps = 1e-8
+        neg = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + eps).log())
+        pos = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + eps).log())
+        class_cost = pos[:, tgt_ids] - neg[:, tgt_ids]              # [B*Q, sumNt]
+
+        bbox_cost = torch.cdist(out_bbox, tgt_bbox, p=1)             # [B*Q, sumNt]
+        giou_cost = -_pairwise_giou(_box_cxcywh_to_xyxy(out_bbox),
+                                    _box_cxcywh_to_xyxy(tgt_bbox))   # [B*Q, sumNt]
+
+        C = (self.class_cost * class_cost
+             + self.bbox_cost * bbox_cost
+             + self.giou_cost * giou_cost)
+        C = C.view(bs, nq, -1).cpu()
+
+        indices = []
+        offset = 0
+        for b, n_tgt in enumerate(sizes):
+            if n_tgt == 0:
+                indices.append((torch.empty(0, dtype=torch.long, device=device),
+                                torch.empty(0, dtype=torch.long, device=device)))
+                continue
+            cost_b = C[b, :, offset:offset + n_tgt].numpy()
+            q_idx, t_idx = linear_sum_assignment(cost_b)
+            indices.append((torch.as_tensor(q_idx, dtype=torch.long, device=device),
+                            torch.as_tensor(t_idx, dtype=torch.long, device=device)))
+            offset += n_tgt
+        return indices
 
 
 #--------- Model wrapper with OV head and loss ----------
@@ -323,36 +505,64 @@ class ModelWithOV(nn.Module):
         super().__init__()
         self.base = base
         self.ov_head = ov_head
-        self.text_embeds = text_embeds
+        self.register_buffer("text_embeds", text_embeds, persistent=False)
+        # Self-contained Hungarian matcher (HF moved RTDetrHungarianMatcher across
+        # releases; we don't depend on its location). Cost weights mirror RT-DETR
+        # defaults, falling back if the config doesn't expose them.
+        cfg = base.config
+        self.matcher = RAPTORHungarianMatcher(
+            class_cost=getattr(cfg, "matcher_class_cost", 2.0),
+            bbox_cost=getattr(cfg, "matcher_bbox_cost", 5.0),
+            giou_cost=getattr(cfg, "matcher_giou_cost", 2.0),
+            alpha=getattr(cfg, "matcher_alpha", 0.25),
+            gamma=getattr(cfg, "matcher_gamma", 2.0),
+        )
 
     def forward(self, **batch):
         """
         Forward pass with OV head and loss.
 
+        OV target construction (replaces prior self-distillation):
+            1. Run RT-DETR Hungarian matcher on (logits, pred_boxes) vs GT.
+            2. For each matched query, write a 1.0 at the GT class index.
+            3. Unmatched queries stay all-zero — focal BCE handles imbalance,
+               so we do NOT mask them out (RT-DETR has no background class
+               under focal loss).
+
         :param batch: Input batch containing pixel values and labels.
         :return: Model outputs with added OV loss if in training mode.
         """
-        outputs = self.base(**batch)
         if self.training and self.ov_head is not None and self.text_embeds is not None:
+            outputs = self.base(**batch, output_hidden_states=True)
             dec = getattr(outputs, "decoder_hidden_states", None)
-            if dec is not None and len(dec) > 0:
-                dec = dec[-1]  # [B,Q,C]
-                ov_logits = self.ov_head(dec, self.text_embeds)  # [B,Q,T]
-                pred = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
-                hard = pred.argmax(-1)  # [B,Q]
-                b, q = hard.shape
-                T = ov_logits.shape[-1]
-                num_labels = pred.shape[-1]
-                mask = hard < (num_labels - 1)
-                target = torch.zeros((b, q, T), device=ov_logits.device)
-                target.scatter_(-1, hard.unsqueeze(-1).clamp_max(T-1), 1.0)
+            labels = batch.get("labels", None)
+            if dec is not None and len(dec) > 0 and labels is not None:
+                dec = dec[-1]                                       # [B,Q,C]
+                ov_logits = self.ov_head(dec, self.text_embeds)     # [B,Q,T]
+                B, Q, T = ov_logits.shape
+
+                with torch.no_grad():
+                    indices = self.matcher(
+                        {"logits": outputs.logits, "pred_boxes": outputs.pred_boxes},
+                        labels,
+                    )
+
+                target = torch.zeros((B, Q, T), device=ov_logits.device, dtype=ov_logits.dtype)
+                for b_idx, (q_idx, t_idx) in enumerate(indices):
+                    if q_idx.numel() == 0:
+                        continue
+                    gt_classes = labels[b_idx]["class_labels"][t_idx].long().clamp_max(T - 1)
+                    target[b_idx, q_idx.long(), gt_classes] = 1.0
+
                 ov_loss = binary_focal_with_logits(
-                    ov_logits[mask], target[mask],
+                    ov_logits, target,
                     alpha=LossConfig.ov_alpha,
                     gamma=LossConfig.ov_gamma,
-                    reduction="mean"
+                    reduction="mean",
                 )
-                outputs.loss = outputs.loss + self.loss_cfg.ov_weight * ov_loss
+                outputs.loss = outputs.loss + LossConfig.ov_weight * ov_loss
+        else:
+            outputs = self.base(**batch)
         return outputs
 
 
@@ -476,13 +686,16 @@ def build_model(num_labels: int,
     7. The function uses global configuration parameters defined in the Config class.
     8. The OV head is configured with specific loss parameters for open-vocabulary detection.
     """
+    # Build RT-DETR with a placeholder ResNet backbone purely to size the
+    # encoder's input projections. We then swap in our DINOv3 + FPN adapter,
+    # matching the channel sizes the placeholder reported.
     cfg = RTDetrConfig(
         num_labels=num_labels,
         id2label={i: id2label[i] for i in id2label},
         label2id=label2id,
-        use_pretrained_backbone=True,
-        backbone=Config.PRETRAINED_BACKBONE,             # DINOv3 backbone
-        backbone_kwargs={"out_indices": (0,1,2)},
+        use_pretrained_backbone=False,                   # weights come from DINOv3 below
+        backbone="resnet50",                             # placeholder for channel sizing
+        backbone_kwargs={"out_indices": (1, 2, 3)},
         freeze_backbone_batch_norms=True,
 
         # ---- long-tail / focal knobs ----
@@ -490,11 +703,17 @@ def build_model(num_labels: int,
         focal_loss_alpha=Config.FOREGROUND_ALPHA,
         focal_loss_gamma=Config.FOCAL_GAMMA,
         weight_loss_vfl=Config.VFL_WEIGHT,               # 1.0 keeps VFL on; 0.0 for pure focal
-        eos_coefficient=Config.EOS_COEF,                  # downweight "no object"
+        eos_coefficient=Config.EOS_COEF,                 # downweight "no object"
     )
     model = RTDetrForObjectDetection(cfg)
-    if Config.FREEZE_BACKBONE:
-        for _, p in model.backbone.named_parameters(): p.requires_grad_(False)
+
+    # Replace the placeholder backbone with DINOv3 ViT + ViTDet-style FPN.
+    fpn_channels = list(model.model.backbone.intermediate_channel_sizes)
+    model.model.backbone = DinoV3FPNBackbone(
+        Config.PRETRAINED_BACKBONE,
+        fpn_channels,
+        freeze=Config.FREEZE_BACKBONE,
+    )
 
     if Config.USE_OV_HEAD:
         text_names = [id2label[i] for i in sorted(id2label)]
@@ -566,7 +785,7 @@ class LongTailTrainer(Trainer):
             self.train_ds,
             batch_size=self._train_batch_size,
             sampler=sampler,
-            num_workers=os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", 4),
+            num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", "4")),
             collate_fn=collate_fn,
             pin_memory=True
         )
@@ -602,7 +821,8 @@ def train():
 
     :return: None
     """
-    if os.getenv("RAPTOR_WANDB_PROJECT_ENABLED", "true").lower() in ("true", "1", "yes"):
+    wandb_enabled = os.getenv("RAPTOR_WANDB_PROJECT_ENABLED", "true").lower() in ("true", "1", "yes")
+    if wandb_enabled:
         wandb.init(project=os.getenv("RAPTOR_WANDB_PROJECT", "dinov3_lvis_oi_rtdetr"),
                name=os.getenv("RAPTOR_WANDB_RUN_NAME", "focal_vfl_classaware"))
 
@@ -624,11 +844,11 @@ def train():
         warmup_ratio=float(os.getenv("RAPTOR_TRAIN_WARMUP_RATIO", 0.05)),
         weight_decay=float(os.getenv("RAPTOR_TRAIN_WEIGHT_DECAY", 0.05)),
         logging_steps=int(os.getenv("RAPTOR_TRAIN_LOGGING_STEPS", 50)),
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         fp16=torch.cuda.is_available(),
         dataloader_num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", 4)),
-        report_to=["wandb"],
+        report_to=["wandb"] if wandb_enabled else [],
     )
 
     trainer = LongTailTrainer(
@@ -643,7 +863,8 @@ def train():
     save_dir = os.path.join(model_dir, "final")
     os.makedirs(save_dir, exist_ok=True)
     trainer.save_model(save_dir)
-    wandb.finish()
+    if wandb_enabled:
+        wandb.finish()
 
 def main():
     """
