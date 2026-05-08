@@ -42,9 +42,21 @@ Training script for DINOv3 + RTDETR on custom MoD (mixture of data).
 @copyright: Copyright 2025 Nikhil Bhargava
 
 To run:
+
 export RAPTOR_WANDB_PROJECT="raptor-dinov3-rtdetr"
-export RAPTOR_WANDB_RUN_NAME="full-50ep-bf16-unfreeze80pct"                             
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python train/train_dinov3_rtdetr_ov.py --config-file config.json
+export RAPTOR_WANDB_RUN_NAME="50ep-bs48-bf16-a6000"
+export RAPTOR_TRAIN_BATCH_SIZE=48 
+export RAPTOR_TRAIN_VAL_BATCH_SIZE=32 
+export RAPTOR_TRAIN_ACCUM_STEPS=1 
+export RAPTOR_TRAIN_EPOCHS=20
+export RAPTOR_ACCELERATE_NUM_PROCESSES=12
+export RAPTOR_EVAL_BATCH_SIZE=32                    
+                                                                                                                        
+# OPTIONAL: scale LR up slightly to compensate for 3× larger batch.                                                     
+# Standard sqrt-scaling: 2e-4 × sqrt(3) ≈ 3.5e-4. Or keep conservative at 2e-4.                                         
+export RAPTOR_TRAIN_LEARNING_RATE=3e-4      
+                                                                                                                   
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python train/train_dinov3_rtdetr_ov.py --config-file config.json > logs/train.log 2>&1
 """
 
 logger = get_logger(__name__)
@@ -84,6 +96,12 @@ class CocoDetDataset(Dataset):
         self.processor = processor
         self.id2label = id2label
         self.images = self.coco.loadImgs(self.img_ids)
+        # Dense 0-indexed remap: COCO often uses 1-indexed (or sparse) category IDs,
+        # but the model's classifier outputs num_classes logits indexed [0, num_classes).
+        # Build both directions; __getitem__ uses cat_id_to_idx, COCO eval uses idx_to_cat_id.
+        self.cat_ids_sorted = sorted(self.coco.cats.keys())
+        self.cat_id_to_idx = {cid: idx for idx, cid in enumerate(self.cat_ids_sorted)}
+        self.idx_to_cat_id = {idx: cid for idx, cid in enumerate(self.cat_ids_sorted)}
 
     def _resolve_path(self, file_name: str) -> Path:
         """
@@ -144,8 +162,22 @@ class CocoDetDataset(Dataset):
         anns = self.coco.loadAnns(ann_ids)
         objects = []
         for a in anns:
-            x,y,w,h = a["bbox"]
-            objects.append({"category_id": int(a["category_id"]), "bbox": [x,y,w,h], "area": a.get("area", w*h), "iscrowd": a.get("iscrowd",0)})
+            x, y, w, h = a["bbox"]
+            # Skip degenerate boxes (zero or negative size — they crash GIoU).
+            if w <= 0 or h <= 0:
+                continue
+            raw_cid = int(a["category_id"])
+            # Skip annotations whose category isn't in the categories list, and
+            # remap the rest to dense 0-indexed so they're valid model class indices.
+            dense_idx = self.cat_id_to_idx.get(raw_cid)
+            if dense_idx is None:
+                continue
+            objects.append({
+                "category_id": dense_idx,
+                "bbox": [x, y, w, h],
+                "area": a.get("area", w * h),
+                "iscrowd": a.get("iscrowd", 0),
+            })
         target = {"image_id": int(iminfo["id"]), "annotations": objects}
 
         processed = self.processor(
@@ -203,9 +235,12 @@ def build_idmaps(coco_json: Path) -> Tuple[Dict[int,str], Dict[str,int]]:
     :rtype: (Dict[int,str], Dict[str,int])
     """
     js = json.load(open(coco_json))
-    cats = js["categories"]
-    id2label = {c["id"]: c["name"] for c in cats}
-    label2id = {v:k for k,v in id2label.items()}
+    # Sort by raw COCO id, then assign dense 0-indexed positions. Must use the
+    # same ordering as CocoDetDataset so the model's id2label aligns with the
+    # class_labels the dataset produces.
+    cats = sorted(js["categories"], key=lambda c: c["id"])
+    id2label = {idx: c["name"] for idx, c in enumerate(cats)}
+    label2id = {v: k for k, v in id2label.items()}
     return id2label, label2id
 
 
@@ -522,6 +557,9 @@ class ModelWithOV(nn.Module):
         # releases; we don't depend on its location). Cost weights mirror RT-DETR
         # defaults, falling back if the config doesn't expose them.
         cfg = base.config
+        # Expose config so HF Trainer's W&B integration can log model metadata
+        # (it does `model.config.to_dict()` to serialize architecture into the run).
+        self.config = cfg
         self.matcher = RAPTORHungarianMatcher(
             class_cost=getattr(cfg, "matcher_class_cost", 2.0),
             bbox_cost=getattr(cfg, "matcher_bbox_cost", 5.0),
@@ -529,6 +567,17 @@ class ModelWithOV(nn.Module):
             alpha=getattr(cfg, "matcher_alpha", 0.25),
             gamma=getattr(cfg, "matcher_gamma", 2.0),
         )
+
+    def num_parameters(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
+        """
+        HuggingFace's WandbCallback calls model.num_parameters() to log model size.
+        nn.Module doesn't define this — only PreTrainedModel does — so we provide
+        the same signature here.
+        """
+        params = self.parameters()
+        if only_trainable:
+            params = (p for p in params if p.requires_grad)
+        return sum(p.numel() for p in params)
 
     def forward(self, **batch):
         """

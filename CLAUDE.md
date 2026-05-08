@@ -36,24 +36,36 @@ huggingface-cli login  # Required: accept DINOv3 license gate
 ### Configuration System
 `config.json` → `common/env.py` flattens nested JSON into env vars (e.g., `RAPTOR_TRAIN_BATCH_SIZE`) → `common/config.py` `Config` dataclass reads them. All scripts call `load_env_from_json()` as the first step.
 
+**Shell env wins over JSON by default** (12-factor convention). `load_env_from_json(..., override=False)` skips keys already present in `os.environ`, so `export RAPTOR_TRAIN_BATCH_SIZE=48` from a launch script overrides whatever the JSON file says without editing it. Pass `override=True` only if you want the file to win.
+
 ### Training (`train/train_dinov3_rtdetr_ov.py`)
-- `CocoDetDataset`: COCO-format dataset loader with multi-root image paths
-- `DinoV3FPNBackbone`: ViTDet-style multi-scale adapter that turns DINOv3 ViT's single stride-16 output into three feature maps at strides 8/16/32 for RT-DETR's HybridEncoder (ConvTranspose2d 2× / 1×1 / stride-2 3×3). Built once and swapped into `model.model.backbone` after RT-DETR is constructed with a placeholder ResNet for sizing.
-- `OVHead`: Linear projection from RT-DETR decoder hidden states → SigLIP embedding space, with a learned CLIP-style `logit_scale`
-- `ModelWithOV`: Wraps `RTDetrForObjectDetection`. Forces `output_hidden_states=True` during training, runs `RTDetrHungarianMatcher` over `(logits, pred_boxes)` vs GT to assign queries → GT class IDs, and uses those as the multi-hot focal-BCE target for the OV head (NOT the closed-set head's own argmax). `text_embeds` is registered as a non-persistent buffer so it tracks device/dtype.
-- `build_text_embeddings()`: Encodes class names with `google/siglip-so400m-patch14-384` via `SiglipModel.get_text_features` (batched), then frees the text encoder
-- `compute_image_weights_from_json()`: Inverse-frequency class-aware sampler (β=0.5 or 1.0)
-- Training uses HF `Trainer` with fp16, gradient accumulation (4 steps), cosine LR; W&B is gated on `RAPTOR_WANDB_PROJECT_ENABLED`
+- `CocoDetDataset`: COCO-format dataset loader with multi-root image paths. Builds `cat_ids_sorted`, `cat_id_to_idx`, and `idx_to_cat_id` at init so raw COCO category IDs (1-indexed, sparse, up to ~1579) are remapped to a dense 0-indexed space `[0, K)` matching the model's classifier slots. `__getitem__` filters degenerate boxes (`w<=0` or `h<=0`) and unknown categories, applies the processor (letterbox resize), then **pads to a square** (`Config.IMAGE_SIZE.longest_edge`) and rescales boxes by `(sx, sy)` so all samples in a batch stack cleanly. Label tensors are NOT squeezed — single-annotation images would otherwise collapse `(1,4)` → `(4,)` and break box-axis indexing.
+- `build_idmaps()`: returns dense 0-indexed `id2label = {idx: c["name"] for idx, c in enumerate(sorted(categories, key=id))}` and the inverse `label2id`. Must match the dataset's dense space — out-of-range class labels surface as deferred CUDA `IndexKernel.cu:93: index out of bounds` asserts inside the matcher's focal cost.
+- `DinoV3FPNBackbone`: ViTDet-style multi-scale adapter that turns DINOv3 ViT's single stride-16 output into three feature maps at strides 8/16/32 for RT-DETR's HybridEncoder (ConvTranspose2d 2× / 1×1 / stride-2 3×3). Built once and swapped into `model.model.backbone` after RT-DETR is constructed with a placeholder ResNet for sizing. Patch tokens are sliced as `last[:, -N:, :]` so register tokens at the front are excluded.
+- `OVHead`: Linear projection from RT-DETR decoder hidden states → SigLIP embedding space, with a learned CLIP-style `logit_scale`.
+- `RAPTORHungarianMatcher`: Self-contained matcher (focal class cost + L1 box + GIoU, solved via `scipy.optimize.linear_sum_assignment`) keyed off `RTDetrConfig` cost weights. Written locally because `RTDetrHungarianMatcher` has moved across `transformers` releases and is not import-stable.
+- `ModelWithOV`: Wraps `RTDetrForObjectDetection`. Forces `output_hidden_states=True` during training, runs `RAPTORHungarianMatcher` over `(logits, pred_boxes)` vs GT to assign queries → GT class IDs, and uses those as the multi-hot focal-BCE target for the OV head (NOT the closed-set head's own argmax — that would be self-distillation). `text_embeds` is registered as a non-persistent buffer so it tracks device/dtype. Defines an explicit `num_parameters(only_trainable, exclude_embeddings)` method because HF's `WandbCallback` calls `model.num_parameters()` which `nn.Module` doesn't provide.
+- `build_text_embeddings()`: Encodes class names with `google/siglip-so400m-patch14-384` via `SiglipTextModel.pooler_output` (batched), then frees the text encoder. `SiglipModel.get_text_features` returns `BaseModelOutputWithPooling` (not a tensor) in current `transformers` releases, so we use `SiglipTextModel` directly — also halves memory because we don't load the vision tower.
+- `compute_image_weights_from_json()`: Inverse-frequency class-aware sampler (β=0.5 or 1.0).
+- Training uses HF `Trainer` with bf16 (preferred over fp16 — RT-DETR's focal/VFL is unstable in fp16), gradient accumulation, cosine LR; W&B is gated on `RAPTOR_WANDB_PROJECT_ENABLED`.
 
 ### Pre-training smoke test (`train/smoke_test.py`)
 **Always run before launching a long training run.** Validates: dataset/processor build, model assembly, DINOv3 body fully frozen, FPN produces correct stride-8/16/32 shapes, gradients reach the OV head and FPN but NOT the body, the model can overfit a single batch >50% in 300 steps (the single best predictor of "training will learn"), eval forward pass is finite, sampler weights are non-uniform. Fails fast and loud — first failed assertion exits non-zero.
 
 ### W&B logging callbacks (`train/wandb_callbacks.py`)
 Four `TrainerCallback` classes attached automatically when `RAPTOR_WANDB_PROJECT_ENABLED` is on:
-- `PeriodicCOCOEvalCallback` — full COCO mAP every epoch on val (`val/coco/map`, `map_50`, `map_75`, `map_small/medium/large`, `ap_rare/common/frequent`). Stores history for end-of-run plots.
+- `PeriodicCOCOEvalCallback` — full COCO mAP every epoch on val (`val/coco/map`, `map_50`, `map_75`, `map_small/medium/large`, `ap_rare/common/frequent`). Translates dense class indices back to original COCO category IDs via `val_ds.idx_to_cat_id` before submitting to `coco_gt.loadRes` — pycocotools matches on the original ID space. Stores history for end-of-run plots.
 - `SamplePredictionsCallback` — every 2 epochs, runs inference on a fixed pool of 8 val images and logs annotated PIL images to W&B for qualitative inspection.
 - `BackboneUnfreezeCallback` — at 80% of `num_train_epochs`, unfreezes the last 2 DINOv3 blocks at 0.1× LR by adding them to the existing optimizer.
-- `EndOfRunArtifactsCallback` — on train end, uploads the `final/` model directory as a versioned W&B Artifact, plus tables for mAP-history, top/bottom-50 per-class AP, AP-by-frequency-slice, and top-30 most-confused class pairs.
+- `EndOfRunArtifactsCallback` — on train end, uploads the `final/` model directory as a versioned W&B Artifact, plus tables for mAP-history, top/bottom-50 per-class AP, AP-by-frequency-slice, and top-30 most-confused class pairs. Per-class AP keys come back from pycocotools in original-COCO-id space; `_name_for(orig_cid)` translates them back through `cat_id_to_idx` → `id2label` to produce human-readable labels.
+
+### Class-label space (gotcha)
+Three places must agree on what a class index means:
+1. **Model's classifier output**: dense `[0, K)` slots, where `K = num_labels`.
+2. **Loss/matcher input**: every `class_labels` tensor coming out of `__getitem__` must be in the same dense `[0, K)` space.
+3. **pycocotools eval input**: needs the **original** COCO category IDs (`category_id` in the JSON). The dataset stores `cat_id_to_idx` and `idx_to_cat_id` so callbacks can translate dense → original on the way out.
+
+A mismatch shows up as `IndexKernel.cu:93: index out of bounds` from somewhere deep inside the matcher (often inside `generalized_box_iou`'s box-validity check, because CUDA errors are async/deferred). Set `CUDA_LAUNCH_BLOCKING=1` to get a non-deferred trace at the real failing line.
 
 ### Tunable env knobs (training)
 | Env var | Default | What it controls |

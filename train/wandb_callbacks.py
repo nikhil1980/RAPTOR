@@ -207,8 +207,10 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
                 labels = dets["labels"].cpu().numpy()
                 for b, s, l in zip(boxes, scores, labels):
                     x1, y1, x2, y2 = b.tolist()
+                    # Map dense model index -> original COCO category_id for COCO eval.
+                    orig_cid = self.val_ds.idx_to_cat_id.get(int(l), int(l))
                     all_results.append({
-                        "image_id": img_id, "category_id": int(l),
+                        "image_id": img_id, "category_id": orig_cid,
                         "bbox": [x1, y1, x2 - x1, y2 - y1], "score": float(s),
                     })
         elapsed = time.perf_counter() - t0
@@ -401,8 +403,16 @@ class EndOfRunArtifactsCallback(TrainerCallback):
     def _log_per_class_ap(self):
         last = self.periodic_eval.history[-1]
         per_class = last["per_class_ap"]
-        id2label = self.periodic_eval.id2label
-        rows = [(cid, id2label.get(cid, str(cid)), ap)
+        id2label = self.periodic_eval.id2label  # dense 0-indexed
+        val_ds = self.periodic_eval.val_ds
+        # per_class is keyed by ORIGINAL COCO category IDs (from coco_eval).
+        # Look up names via dense index: orig_cid -> dense_idx -> name.
+        def _name_for(orig_cid):
+            dense = val_ds.cat_id_to_idx.get(orig_cid)
+            if dense is None:
+                return str(orig_cid)
+            return id2label.get(dense, str(orig_cid))
+        rows = [(cid, _name_for(cid), ap)
                 for cid, ap in per_class.items() if not np.isnan(ap)]
         rows.sort(key=lambda r: -r[2])
         top = rows[:50]
@@ -493,6 +503,8 @@ class EndOfRunArtifactsCallback(TrainerCallback):
             logger.info("Confusion pairs: no off-diagonal matches above thresh; skipping table")
             return
         top = sorted(confusion.items(), key=lambda kv: -kv[1])[:self.confusion_top_k]
+        # Both GT and predicted classes are dense 0-indexed here (from class_labels
+        # and post_process_object_detection respectively); id2label is dense too.
         id2label = ev.id2label
         tbl = wandb.Table(columns=["gt_class", "pred_class", "count"])
         for (gc, pc), n in top:

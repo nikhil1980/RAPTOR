@@ -69,14 +69,17 @@ def _flatten(d: Dict[str, Any], prefix_path=()):
 
 def load_env_from_json(json_path: str = "config.json",
                        prefix: str = "RAPTOR_",
-                       override: bool = True
+                       override: bool = False
                        ) -> None:
     """
     Load env vars from JSON, flattening nested keys:
       { "train": { "batch_size": 2 } } -> RAPTOR_TRAIN_BATCH_SIZE=2
-    If override=False, existing os.environ keys are preserved.
 
-    :param override: Whether to override existing env vars (default True)
+    Shell env wins over JSON by default (12-factor convention) so users can
+    override config-file values with `export RAPTOR_TRAIN_BATCH_SIZE=16`
+    without editing the file. Pass override=True to force JSON to win.
+
+    :param override: Whether to override existing env vars (default False — shell wins)
     :param json_path: Path to JSON file
     :param prefix: Optional prefix for env vars
 

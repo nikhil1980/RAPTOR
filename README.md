@@ -99,12 +99,28 @@ export WANDB_PROJECT=<NAME YOUR PROJECT>
 python train/train_dinov3_rtdetr_ov.py --config-file config.json
 ```
 
+Shell `export` always wins over `config.json` — the loader in `common/env.py` only fills in env vars that are not already set. So a launch script like:
+```bash
+export RAPTOR_TRAIN_BATCH_SIZE=48
+export RAPTOR_TRAIN_VAL_BATCH_SIZE=32
+export RAPTOR_TRAIN_ACCUM_STEPS=1
+export RAPTOR_TRAIN_EPOCHS=50
+export RAPTOR_ACCELERATE_NUM_PROCESSES=12
+export RAPTOR_EVAL_BATCH_SIZE=32
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+  python train/train_dinov3_rtdetr_ov.py --config-file config.json
+```
+saturates an A6000-class GPU without touching the JSON. If you instead want the file to win, pass `override=True` to `load_env_from_json()`.
+
 At the end, you'll get the following:
- * DINOv3 backbone (frozen by default) plugged into RT-DETR
- * Focal/Varifocal classification, low eos weight (downweight background)
+ * DINOv3 backbone (frozen by default; last 2 blocks unfreeze at 80% of training when `RAPTOR_UNFREEZE_BACKBONE_FRAC<1.0`) plugged into RT-DETR via a ViTDet-style FPN that synthesizes stride-8/16/32 features
+ * Focal/Varifocal classification, low eos weight (downweight background), bf16 (auto-falls-back to fp16 if GPU lacks bf16 — RT-DETR's focal/VFL is unstable in fp16)
  * WeightedRandomSampler using inverse-frequency image weights
- * Optional OV head with focal-BCE on text matches
- * W&B logs with final weights at ```../runs/dinov3_rtdetr/final/``` 
+ * OV head with focal-BCE on **Hungarian-matched GT class IDs** (not self-distilled from the closed-set head)
+ * Per-epoch COCO mAP, sample-prediction overlays every 2 epochs, end-of-run model artifact + per-class AP / confusion-pair tables — all in W&B
+ * Final weights at ```../runs/dinov3_rtdetr/final/```
+
+> **Class-label space gotcha.** Dataset, model, and matcher all operate in a dense 0-indexed `[0, K)` class space — `CocoDetDataset` builds `cat_id_to_idx` to remap raw COCO category IDs (1-indexed, sparse, up to ~1579) at load time. pycocotools eval still wants original IDs, so the W&B callbacks translate back via `idx_to_cat_id` before calling `coco_gt.loadRes`. If you hack the data path, keep these two spaces straight or you'll see a deferred `IndexKernel.cu:93: index out of bounds` from inside the matcher; rerun with `CUDA_LAUNCH_BLOCKING=1` to surface the real line.
  
 5. Evaluate RAPTOR via COCO mAP, LVIS APr/APc/APf, PR plots
 ```
