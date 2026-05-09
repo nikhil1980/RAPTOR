@@ -2,6 +2,11 @@ import os, sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# Mitigate CUDA memory fragmentation on long runs. Must be set before any
+# `import torch` path that touches CUDA, hence top-of-file.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import glob
 import json, math
 import time
 from pathlib import Path
@@ -43,6 +48,10 @@ Training script for DINOv3 + RTDETR on custom MoD (mixture of data).
 
 To run:
 
+# Open a tmux session, run the process and exit the session (CTRL + B then D)
+tmux new -s  raptor   
+
+export WANDB_PROJECT=RAPTOR
 export RAPTOR_WANDB_PROJECT="raptor-dinov3-rtdetr"
 export RAPTOR_WANDB_RUN_NAME="50ep-bs48-bf16-a6000"
 export RAPTOR_TRAIN_BATCH_SIZE=48 
@@ -52,11 +61,14 @@ export RAPTOR_TRAIN_EPOCHS=20
 export RAPTOR_ACCELERATE_NUM_PROCESSES=12
 export RAPTOR_EVAL_BATCH_SIZE=32                    
                                                                                                                         
-# OPTIONAL: scale LR up slightly to compensate for 3× larger batch.                                                     
-# Standard sqrt-scaling: 2e-4 × sqrt(3) ≈ 3.5e-4. Or keep conservative at 2e-4.                                         
+# OPTIONAL: scale LR up slightly to compensate for 3× larger batch.
+# Standard sqrt-scaling: 2e-4 × sqrt(3) ≈ 3.5e-4. Or keep conservative at 2e-4.
+
 export RAPTOR_TRAIN_LEARNING_RATE=3e-4      
-                                                                                                                   
+                                                                                                         
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python train/train_dinov3_rtdetr_ov.py --config-file config.json > logs/train.log 2>&1
+
+tmux attach -t raptor 
 """
 
 logger = get_logger(__name__)
@@ -488,18 +500,22 @@ class RAPTORHungarianMatcher(nn.Module):
     @torch.no_grad()
     def forward(self, outputs: Dict[str, torch.Tensor], targets: List[Dict[str, torch.Tensor]]):
         bs, nq = outputs["logits"].shape[:2]
-        out_prob = outputs["logits"].flatten(0, 1).sigmoid()        # [B*Q, K]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1).float()       # [B*Q, 4]
+        device = outputs["pred_boxes"].device
+        # Build the full [B*Q, sumNt] cost matrix on CPU. linear_sum_assignment
+        # runs on CPU anyway; keeping the transient class/bbox/giou tensors
+        # off-GPU avoids hundreds-of-MB spikes that previously OOM'd long runs
+        # whose reserved cache had fragmented.
+        out_prob = outputs["logits"].flatten(0, 1).sigmoid().float().cpu()    # [B*Q, K]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1).float().cpu()           # [B*Q, 4]
 
         sizes = [int(t["class_labels"].numel()) for t in targets]
-        device = out_bbox.device
         if sum(sizes) == 0:
             empty = (torch.empty(0, dtype=torch.long, device=device),
                      torch.empty(0, dtype=torch.long, device=device))
             return [empty for _ in range(bs)]
 
-        tgt_ids = torch.cat([t["class_labels"] for t in targets]).long()
-        tgt_bbox = torch.cat([t["boxes"] for t in targets]).float()
+        tgt_ids = torch.cat([t["class_labels"] for t in targets]).long().cpu()
+        tgt_bbox = torch.cat([t["boxes"] for t in targets]).float().cpu()
 
         eps = 1e-8
         neg = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + eps).log())
@@ -513,7 +529,7 @@ class RAPTORHungarianMatcher(nn.Module):
         C = (self.class_cost * class_cost
              + self.bbox_cost * bbox_cost
              + self.giou_cost * giou_cost)
-        C = C.view(bs, nq, -1).cpu()
+        C = C.view(bs, nq, -1)
 
         indices = []
         offset = 0
@@ -776,6 +792,16 @@ def build_model(num_labels: int,
         freeze=Config.FREEZE_BACKBONE,
     )
 
+    # Activation checkpointing on the RT-DETR encoder/decoder transformer
+    # layers — recomputes activations on backward instead of storing them.
+    # ~30–40% activation memory at ~15% step-time cost. Critical at large
+    # train batch sizes (e.g., bs=48 on a 48 GiB A6000) where encoder/decoder
+    # activations dominate. Toggle via env var.
+    if os.getenv("RAPTOR_TRAIN_GRADIENT_CHECKPOINTING", "true").lower() in ("true", "1", "yes"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+
     if Config.USE_OV_HEAD:
         text_names = [id2label[i] for i in sorted(id2label)]
         text_embeds = build_text_embeddings(text_names, device=device)
@@ -991,7 +1017,15 @@ def train():
         eval_dataset=val_ds,
         callbacks=callbacks,
     )
-    trainer.train()
+
+    # Auto-resume from the latest checkpoint in `model_dir` if one exists.
+    # Set RAPTOR_TRAIN_AUTO_RESUME=false to force a fresh run.
+    auto_resume = os.getenv("RAPTOR_TRAIN_AUTO_RESUME", "true").lower() in ("true", "1", "yes")
+    ckpts = glob.glob(os.path.join(model_dir, "checkpoint-*")) if auto_resume else []
+    resume = True if ckpts else None
+    if resume:
+        logger.info(f"---> RESUMING FROM LATEST CHECKPOINT IN {model_dir} <---")
+    trainer.train(resume_from_checkpoint=resume)
     save_dir = os.path.join(model_dir, "final")
     os.makedirs(save_dir, exist_ok=True)
     trainer.save_model(save_dir)
