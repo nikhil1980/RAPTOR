@@ -792,15 +792,29 @@ def build_model(num_labels: int,
         freeze=Config.FREEZE_BACKBONE,
     )
 
-    # Activation checkpointing on the RT-DETR encoder/decoder transformer
-    # layers — recomputes activations on backward instead of storing them.
-    # ~30–40% activation memory at ~15% step-time cost. Critical at large
-    # train batch sizes (e.g., bs=48 on a 48 GiB A6000) where encoder/decoder
-    # activations dominate. Toggle via env var.
+    # Manual activation checkpointing on RT-DETR decoder layers.
+    # RTDetrForObjectDetection has `_supports_gradient_checkpointing = False`,
+    # so HF's `gradient_checkpointing_enable()` raises ValueError. The decoder's
+    # cross-attention (300 queries × multi-scale encoder tokens × 6 layers) is
+    # the dominant activation cost; wrapping each layer's forward in
+    # torch.utils.checkpoint recomputes those activations on backward instead
+    # of storing them — ~25-35% memory at ~15% step-time cost.
     if os.getenv("RAPTOR_TRAIN_GRADIENT_CHECKPOINTING", "true").lower() in ("true", "1", "yes"):
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-        )
+        from torch.utils.checkpoint import checkpoint as _ckpt
+
+        def _wrap_with_checkpoint(layer: nn.Module) -> None:
+            _orig = layer.forward
+            def _checkpointed_forward(*args, **kwargs):
+                return _ckpt(_orig, *args, use_reentrant=False, **kwargs)
+            layer.forward = _checkpointed_forward
+
+        n_wrapped = 0
+        decoder = getattr(getattr(model, "model", None), "decoder", None)
+        if decoder is not None and hasattr(decoder, "layers"):
+            for _layer in decoder.layers:
+                _wrap_with_checkpoint(_layer)
+                n_wrapped += 1
+        logger.info(f"---> Gradient checkpointing wrapped {n_wrapped} decoder layers <---")
 
     if Config.USE_OV_HEAD:
         text_names = [id2label[i] for i in sorted(id2label)]
