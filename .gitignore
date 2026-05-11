@@ -38,6 +38,8 @@ pip-delete-this-directory.txt
 
 fo_mongo/
 wandb/
+runs/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

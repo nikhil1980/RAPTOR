@@ -25,6 +25,13 @@ Basic Script to convert and merge datasets.
 @license: Apache-2.0
 @description: This script converts datasets to COCO format and merges them if needed.
 @copyright: Copyright 2025 Nikhil Bhargava
+
+To run:
+tmux new-session -s convert
+python data/convert_and_merge.py --config-file config.json >logs/convert.log 2>&1
+tmux attach -t convert
+
+tail -f logs/convert.log
 """
 
 logger = get_logger(__name__)
@@ -125,30 +132,74 @@ def export_openimages_to_coco(split: str,
     logger.debug(f"---> [OI-COCO] Written {out_json} <---")
 
 
-def lvis_to_coco_det(lvis_json: json, out_json: json):
+def lvis_to_coco_det(lvis_json: str,
+                     src_image_dirs: list,
+                     out_images_dir: Path,
+                     out_json: str):
     """
     Convert LVIS annotations to COCO detection format.
 
+    LVIS-v1's val set contains some rare-class images sourced from COCO train2017
+    (not val2017), so the actual file may live in either split's directory. For each
+    image, the function searches `src_image_dirs` in order, skips images with no
+    on-disk file (and their dangling annotations), and symlinks resolved images
+    into `out_images_dir` so the merged dataset has a single image root.
+
     :param lvis_json: path to LVIS annotations JSON
+    :param src_image_dirs: directories (in priority order) to search for each image file
+    :param out_images_dir: directory where image symlinks will be created
     :param out_json: path to save COCO annotations JSON
 
     :return: None
     """
     lvis = json.load(open(lvis_json))
+    out_images_dir = Path(out_images_dir)
+    out_images_dir.mkdir(parents=True, exist_ok=True)
+
     # LVIS images lack file_name; derive it from coco_url or zero-padded id
     images = []
+    kept_image_ids = set()
+    skipped_missing = 0
     for im in tqdm(lvis["images"], desc=f"[LVIS] {os.path.basename(lvis_json)} images", unit="img"):
         url = im.get("coco_url", "")
         file_name = os.path.basename(url) if url else f"{im['id']:012d}.jpg"
+
+        # Locate the actual image file on disk (LVIS-v1 val pulls some files from train2017)
+        src_path = None
+        for d in src_image_dirs:
+            candidate = os.path.join(d, file_name)
+            if os.path.isfile(candidate):
+                src_path = candidate
+                break
+        if src_path is None:
+            skipped_missing += 1
+            continue
+
+        # Symlink into the merged image dir so all merged samples share one root
+        link = out_images_dir / file_name
+        if not (link.is_symlink() or link.exists()):
+            try:
+                os.symlink(os.path.abspath(src_path), str(link))
+            except FileExistsError:
+                pass
+
         images.append({
             "id": im["id"],
             "file_name": file_name,
             "height": im.get("height"),
             "width": im.get("width"),
         })
+        kept_image_ids.add(im["id"])
+
+    if skipped_missing:
+        logger.warning(f"---> [LVIS] {os.path.basename(lvis_json)}: skipped "
+                       f"{skipped_missing} images with no source file on disk <---")
+
     categories = lvis["categories"]
     anns = []
     for a in tqdm(lvis["annotations"], desc=f"[LVIS] {os.path.basename(lvis_json)} anns", unit="ann"):
+        if a["image_id"] not in kept_image_ids:
+            continue
         if a.get("bbox"):
             x,y,w,h = a["bbox"]
             anns.append({
@@ -161,6 +212,34 @@ def lvis_to_coco_det(lvis_json: json, out_json: json):
             })
     coco = {"images": images, "annotations": anns, "categories": categories}
     json.dump(coco, open(out_json,"w"))
+    logger.info(f"---> [LVIS] {os.path.basename(lvis_json)}: kept "
+                f"{len(images)} images, {len(anns)} annotations <---")
+
+def verify_merged_against_roots(merged_json: str, image_roots: list, split: str):
+    """
+    Walk every image in `merged_json` and confirm it resolves under one of `image_roots`.
+    Logs a warning with a sample of unresolved files. Returns the unresolved count.
+
+    :param merged_json: path to merged COCO JSON
+    :param image_roots: directories the dataset will search at training time
+    :param split: human label for logs
+
+    :return: number of images that did not resolve
+    """
+    js = json.load(open(merged_json))
+    missing = []
+    for im in js["images"]:
+        fn = im["file_name"]
+        if not any(os.path.isfile(os.path.join(r, fn)) for r in image_roots):
+            missing.append(fn)
+    if missing:
+        sample = ", ".join(missing[:5])
+        logger.error(f"---> [VERIFY] {split}: {len(missing)} of {len(js['images'])} "
+                     f"images do not resolve under {image_roots}. Sample: {sample} <---")
+    else:
+        logger.info(f"---> [VERIFY] {split}: all {len(js['images'])} images resolve <---")
+    return len(missing)
+
 
 def unify_and_merge(json_paths: json, out_json: json):
     """
@@ -296,10 +375,22 @@ def main():
                                           os.path.join(coco_out, "instances_oi_val.json"))
 
                 # B. LVIS (bbox-only) to COCO
+                #    LVIS-v1 references COCO 2017 images. Most lvis_train files live in
+                #    train2017/, most lvis_val in val2017/, but a handful of rare-class
+                #    val images live in train2017/ — search both directories per image.
+                coco_train_dir = os.path.join(par_path, str(Config.TRAIN_IMG_DIRS[0]))
+                coco_val_dir   = os.path.join(par_path, str(Config.VAL_IMG_DIRS[0]))
+
                 lvis_train = annotation_path + "/" + "lvis" + "/" + "lvis_v1_train.json"
                 lvis_val = annotation_path + "/" + "lvis" + "/" + "lvis_v1_val.json"
-                lvis_to_coco_det(lvis_train, os.path.join(coco_out, "instances_lvis_train.json"))
-                lvis_to_coco_det(lvis_val, os.path.join(coco_out, "instances_lvis_val.json"))
+                lvis_to_coco_det(lvis_train,
+                                 [coco_train_dir, coco_val_dir],
+                                 Path(coco_merged_train),
+                                 os.path.join(coco_out, "instances_lvis_train.json"))
+                lvis_to_coco_det(lvis_val,
+                                 [coco_val_dir, coco_train_dir],
+                                 Path(coco_merged_val),
+                                 os.path.join(coco_out, "instances_lvis_val.json"))
 
                 # C. MERGE
                 unify_and_merge(
@@ -312,6 +403,16 @@ def main():
                      os.path.join(coco_out, "instances_oi_val.json")],
                     os.path.join(coco_out, "instances_val_merged.json")
                 )
+
+                # D. Verify every merged image resolves under the configured roots
+                train_roots = [os.path.join(par_path, str(d)) for d in Config.TRAIN_IMG_DIRS]
+                val_roots   = [os.path.join(par_path, str(d)) for d in Config.VAL_IMG_DIRS]
+                verify_merged_against_roots(
+                    os.path.join(coco_out, "instances_train_merged.json"),
+                    train_roots, "train")
+                verify_merged_against_roots(
+                    os.path.join(coco_out, "instances_val_merged.json"),
+                    val_roots, "val")
 
                 end_time = time.perf_counter()
                 logger.debug(f"---> DATASETS CONVERSION/EXPORT TO COCO JSON AND "

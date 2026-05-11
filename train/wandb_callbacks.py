@@ -111,7 +111,16 @@ class SamplePredictionsCallback(TrainerCallback):
             for i in self._fixed_indices:
                 iminfo = self.val_ds.images[i]
                 p = self.val_ds._resolve_path(iminfo["file_name"])
-                self._cached_originals.append(Image.open(p).convert("RGB"))
+                try:
+                    if p is None:
+                        raise FileNotFoundError(iminfo["file_name"])
+                    self._cached_originals.append(Image.open(p).convert("RGB"))
+                except Exception as e:
+                    logger.warning(
+                        f"SamplePredictionsCallback: skipping unreadable val image "
+                        f"idx={i} ({iminfo['file_name']}): {e}"
+                    )
+                    self._cached_originals.append(Image.new("RGB", (640, 640), color=(0, 0, 0)))
         return self._cached_originals
 
     @torch.no_grad()

@@ -11,11 +11,20 @@ import json, math
 import time
 from pathlib import Path
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch, torch.nn as nn
+# Switch torch's shared-memory IPC from FD-passing to /dev/shm-backed files.
+# The default `file_descriptor` strategy consumes 2 FDs per shared tensor sent
+# across worker -> main, which exhausts the per-process ulimit when num_workers
+# is high and pin_memory is on (EMFILE / "unable to open shared memory object").
+# `file_system` is unbounded by FD limits at the cost of relying on /dev/shm
+# space — fine for our setup since batches are small and freed promptly.
+# Must be set before any DataLoader is constructed.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 from torch.utils.data import Dataset, WeightedRandomSampler
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 from transformers import (
     RTDetrForObjectDetection,
@@ -57,7 +66,7 @@ export RAPTOR_WANDB_RUN_NAME="50ep-bs48-bf16-a6000"
 export RAPTOR_TRAIN_BATCH_SIZE=48 
 export RAPTOR_TRAIN_VAL_BATCH_SIZE=32 
 export RAPTOR_TRAIN_ACCUM_STEPS=1 
-export RAPTOR_TRAIN_EPOCHS=20
+export RAPTOR_TRAIN_EPOCHS=2
 export RAPTOR_ACCELERATE_NUM_PROCESSES=12
 export RAPTOR_EVAL_BATCH_SIZE=32                    
                                                                                                                         
@@ -107,7 +116,28 @@ class CocoDetDataset(Dataset):
         self.img_roots = img_roots
         self.processor = processor
         self.id2label = id2label
-        self.images = self.coco.loadImgs(self.img_ids)
+        all_images = self.coco.loadImgs(self.img_ids)
+        # Pre-filter images whose files cannot be resolved across img_roots so
+        # the DataLoader never throws FileNotFoundError mid-epoch (which kills
+        # the worker and tears down the run). Surface the count + a few names
+        # at startup instead.
+        kept, missing = [], []
+        for info in all_images:
+            if self._resolve_path(info["file_name"]) is not None:
+                kept.append(info)
+            else:
+                missing.append(info["file_name"])
+        if missing:
+            sample = ", ".join(missing[:5])
+            more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+            logger.warning(
+                f"CocoDetDataset: {len(missing)}/{len(all_images)} images not found "
+                f"under img_roots={[str(r) for r in self.img_roots]}; skipping. "
+                f"Examples: {sample}{more}"
+            )
+        self.images = kept
+        self.img_ids = [info["id"] for info in kept]
+        self._missing_at_runtime: set = set()
         # Dense 0-indexed remap: COCO often uses 1-indexed (or sparse) category IDs,
         # but the model's classifier outputs num_classes logits indexed [0, num_classes).
         # Build both directions; __getitem__ uses cat_id_to_idx, COCO eval uses idx_to_cat_id.
@@ -115,26 +145,25 @@ class CocoDetDataset(Dataset):
         self.cat_id_to_idx = {cid: idx for idx, cid in enumerate(self.cat_ids_sorted)}
         self.idx_to_cat_id = {idx: cid for idx, cid in enumerate(self.cat_ids_sorted)}
 
-    def _resolve_path(self, file_name: str) -> Path:
+    def _resolve_path(self, file_name: str) -> Optional[Path]:
         """
         Resolve the full path of an image file by searching through the provided image root directories.
 
-        1. Iterates through each directory in img_roots.
-        2. Constructs the full path by joining the directory with the file_name.
-        3. Checks if the constructed path exists.
-        4. If the path exists, returns it as a Path object.
-        5. If the file is not found in any of the directories, returns the file_name as a Path object (may lead to a FileNotFoundError later).
+        Returns the first matching Path, or None if the file is not found in any
+        configured img_root. Callers must handle the None case (we used to return
+        a bare Path(file_name) which silently bubbled up to a worker-killing
+        FileNotFoundError deep in the DataLoader).
 
         :param file_name: Name of the image file.
 
-        :return: Full path to the image file as a Path object.
-        :rtype: Path
+        :return: Full path to the image file, or None if not found.
+        :rtype: Optional[Path]
         """
         for root in self.img_roots:
-            p = Path(root)/file_name
-            if p.exists(): return p
-
-        return Path(file_name)
+            p = Path(root) / file_name
+            if p.exists():
+                return p
+        return None
 
     def __len__(self): return len(self.images)
 
@@ -168,7 +197,20 @@ class CocoDetDataset(Dataset):
         """
         iminfo = self.images[idx]
         img_path = self._resolve_path(iminfo["file_name"])
-        image = Image.open(img_path).convert("RGB")
+        try:
+            if img_path is None:
+                raise FileNotFoundError(iminfo["file_name"])
+            image = Image.open(img_path).convert("RGB")
+        except (FileNotFoundError, OSError, UnidentifiedImageError) as e:
+            # Defensive: pre-filter at __init__ removes resolvable-at-startup
+            # gaps, but a file may still vanish or be corrupt at read time.
+            # Log once per filename and fall through to the next sample so the
+            # DataLoader worker keeps running instead of tearing down training.
+            fname = iminfo["file_name"]
+            if fname not in self._missing_at_runtime:
+                self._missing_at_runtime.add(fname)
+                logger.warning(f"CocoDetDataset: skipping unreadable image idx={idx} ({fname}): {e}")
+            return self.__getitem__((idx + 1) % len(self))
 
         ann_ids = self.coco.getAnnIds(imgIds=iminfo["id"])
         anns = self.coco.loadAnns(ann_ids)
@@ -882,13 +924,19 @@ class LongTailTrainer(Trainer):
             num_samples=len(self.train_ds),  # one epoch in expectation
             replacement=True
         )
+        # Dataloader workers are intentionally decoupled from DDP world-size:
+        # using RAPTOR_ACCELERATE_NUM_PROCESSES here multiplies fanout (world_size
+        # ranks each spawning that many workers) and triggers EMFILE under
+        # pin_memory. Use a dedicated knob with a conservative default.
         return torch.utils.data.DataLoader(
             self.train_ds,
             batch_size=self._train_batch_size,
             sampler=sampler,
-            num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", "4")),
+            num_workers=int(os.getenv("RAPTOR_DATALOADER_NUM_WORKERS",
+                                      str(Config.NUM_WORKERS))),
             collate_fn=collate_fn,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True,
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs)-> torch.Tensor:
@@ -984,7 +1032,14 @@ def train():
         bf16=use_bf16,
         fp16=use_fp16,
         max_grad_norm=float(os.getenv("RAPTOR_TRAIN_MAX_GRAD_NORM", "1.0")),
-        dataloader_num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", "4")),
+        dataloader_num_workers=int(os.getenv("RAPTOR_DATALOADER_NUM_WORKERS",
+                                             str(Config.NUM_WORKERS))),
+        # ModelWithOV.forward uses **batch (kwargs-only), so HF's find_labels()
+        # cannot auto-detect "labels" from the signature and label_names defaults
+        # to []. That makes has_labels=False in prediction_step, the loss branch
+        # is skipped, and eval_loss is never emitted -> metric_for_best lookup
+        # fails. Set explicitly so HF knows which inputs key carries the targets.
+        label_names=["labels"],
         report_to=["wandb"] if wandb_enabled else [],
         run_name=os.getenv("RAPTOR_WANDB_RUN_NAME", "focal_vfl_classaware"),
     )
@@ -999,7 +1054,8 @@ def train():
             id2label=id2label,
             batch_size=int(os.getenv("RAPTOR_EVAL_BATCH_SIZE", "8")),
             score_thresh=float(os.getenv("RAPTOR_EVAL_SCORE_THRESH", "0.05")),
-            num_workers=int(os.getenv("RAPTOR_ACCELERATE_NUM_PROCESSES", "4")),
+            num_workers=int(os.getenv("RAPTOR_DATALOADER_NUM_WORKERS",
+                                      str(Config.NUM_WORKERS))),
         )
         sample_preds = SamplePredictionsCallback(
             val_ds=val_ds,
@@ -1069,7 +1125,14 @@ def main():
                 # 1. Load the environment variables
                 load_env_from_json(config_file_path)
                 Config.ROOT = os.getenv("RAPTOR_PATHS_ROOT")
+                # Env overrides for annotation JSONs let sanity-check runs point at
+                # a subsampled mixture without editing common/config.py. Class attrs
+                # are evaluated at import time (before load_env_from_json), so we
+                # apply the override here, mirroring the Config.ROOT pattern above.
+                Config.TRAIN_JSON = os.getenv("RAPTOR_PATHS_TRAIN_JSON", Config.TRAIN_JSON)
+                Config.VAL_JSON   = os.getenv("RAPTOR_PATHS_VAL_JSON",   Config.VAL_JSON)
                 logger.debug(f"---> Configuration loaded from: {args.config_file} <---")
+                logger.debug(f"---> TRAIN_JSON={Config.TRAIN_JSON}  VAL_JSON={Config.VAL_JSON} <---")
 
                 # 2. Start Training
                 start_time = time.perf_counter()
