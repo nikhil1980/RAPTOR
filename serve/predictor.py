@@ -139,6 +139,63 @@ def load_lexicon(path: Optional[str]) -> List[str]:
         return labels
     return Config.FALLBACK_LEXICON
 
+
+def _letterbox_pad(im: Image.Image, proc) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """Mirror CocoDetDataset's input pipeline so production inference sees the
+    same input distribution as training: RTDetr processor letterbox at
+    Config.IMAGE_SIZE, then bottom-right pad to a fixed S×S square.
+
+    Returns (pixel_values (1, 3, S, S), (orig_h, orig_w)).
+    """
+    target_size = Config.IMAGE_SIZE.get(
+        "longest_edge", Config.IMAGE_SIZE.get("height", 640),
+    )
+    out = proc(images=im, return_tensors="pt", size=Config.IMAGE_SIZE)
+    pv = out["pixel_values"]  # (1, 3, H, W)
+    H, W = pv.shape[-2], pv.shape[-1]
+    if H != target_size or W != target_size:
+        padded = torch.zeros(pv.shape[0], pv.shape[1], target_size, target_size, dtype=pv.dtype)
+        padded[:, :, :H, :W] = pv
+        pv = padded
+    return pv, (im.height, im.width)
+
+
+def _post_process_padded(outputs, proc, threshold: float,
+                         orig_sizes_hw, device) -> List[Dict[str, torch.Tensor]]:
+    """Counterpart to the helper in `train.wandb_callbacks` and `eval.eval_and_infer`.
+
+    Predictions live in [0,1] of the padded S×S frame, not the original (h, w).
+    Scaling post_process by (orig_h, orig_w) squashes boxes along the shorter
+    axis by min/max — so every downstream consumer (NMS, CLIP crop, IoU merge)
+    operates on the wrong region. Scale by (max_dim, max_dim) instead to recover
+    true original-pixel coords inside the letterboxed region, clip to real
+    bounds, and drop zero-area boxes that fell entirely in the pad.
+    """
+    max_per = [int(max(int(s[0]), int(s[1]))) for s in orig_sizes_hw]
+    max_dims = torch.tensor([[m, m] for m in max_per], dtype=torch.long, device=device)
+    res = proc.post_process_object_detection(
+        outputs, threshold=threshold, target_sizes=max_dims,
+    )
+    cleaned: List[Dict[str, torch.Tensor]] = []
+    for i, dets in enumerate(res):
+        oh = int(orig_sizes_hw[i][0])
+        ow = int(orig_sizes_hw[i][1])
+        b = dets["boxes"]
+        if b.numel() == 0:
+            cleaned.append(dets)
+            continue
+        x1 = b[:, 0].clamp(0, ow)
+        y1 = b[:, 1].clamp(0, oh)
+        x2 = b[:, 2].clamp(0, ow)
+        y2 = b[:, 3].clamp(0, oh)
+        keep = (x2 > x1) & (y2 > y1)
+        cleaned.append({
+            "boxes":  torch.stack([x1, y1, x2, y2], dim=1)[keep],
+            "scores": dets["scores"][keep],
+            "labels": dets["labels"][keep],
+        })
+    return cleaned
+
 # --------------------------------
 # OpenCLIP wrapper
 # --------------------------------
@@ -253,7 +310,11 @@ class Predictor:
 
         self.lexicon_all = load_lexicon(lexicon_path)
         self.use_openclip = use_openclip and _HAS_OPENCLIP
-        self.clip = ClipHelper(device=Config.DEVICE) if self.use_openclip else None
+        self.clip = ClipHelper(
+            device=Config.DEVICE,
+            model_name=Config.CLIP_MODEL,
+            pretrained=Config.CLIP_SOURCE,
+        ) if self.use_openclip else None
 
         # Cache text embeddings for lexicon
         self._lex_text_emb: Optional[torch.Tensor] = None
@@ -270,16 +331,25 @@ class Predictor:
         :return: List of closed-set detections
         :rtype: List[Dict[str, Any]]
         """
-        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-        outputs = self.model(**inputs)
-
-        # RTDetrImageProcessor -> postprocess
-        target_sizes = torch.tensor([(image.height, image.width)]).to(self.device)
-        det = self.processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.0)[0]
+        # Match the training input pipeline (letterbox + S×S pad) and undo it
+        # correctly on the way out, so boxes land in true original-pixel coords
+        # rather than being squashed along the shorter axis. The squashed boxes
+        # would otherwise be fed to NMS and to the CLIP crop in the OV path,
+        # poisoning both closed and open-vocab outputs.
+        pv, orig_hw = _letterbox_pad(image, self.processor)
+        pv = pv.to(self.device)
+        outputs = self.model(pixel_values=pv)
+        det = _post_process_padded(
+            outputs, self.processor, 0.0, [torch.tensor(orig_hw)], self.device,
+        )[0]
 
         # Convert to records
         out = []
-        for score, label_id, box in zip(det["scores"].tolist(), det["labels"].tolist(), det["boxes"].tolist()):
+        for score, label_id, box in zip(
+            det["scores"].cpu().tolist(),
+            det["labels"].cpu().tolist(),
+            det["boxes"].cpu().tolist(),
+        ):
             lab = self.id2label.get(int(label_id), str(label_id))
             rec = {"label": lab, "score": float(score), "box": [float(x) for x in box], "source": "closed"}
             out.append(rec)
