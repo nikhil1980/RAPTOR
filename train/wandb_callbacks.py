@@ -89,6 +89,49 @@ def _orig_size_from_label(lab: Dict[str, Any]) -> torch.Tensor:
     return torch.tensor([640, 640])
 
 
+def _post_process_padded(outputs, image_processor, threshold: float,
+                         orig_sizes_hw, device) -> List[Dict[str, torch.Tensor]]:
+    """Post-process detections accounting for the dataset's S×S bottom-right pad.
+
+    `CocoDetDataset` pads every letterboxed image to a fixed S×S square and
+    rescales GT boxes so they live in [0,1] of the padded frame. The model
+    therefore emits boxes in [0,1] of that same padded frame — NOT of the
+    original image. Calling `post_process_object_detection` with `target_sizes
+    = orig (h, w)` scales both axes by the original dims, squashing predictions
+    along the shorter axis by `min(h,w)/max(h,w)` and tanking mAP for every
+    non-square image.
+
+    Fix: pass `target_sizes = (max_dim, max_dim)` per image so post_process
+    scales both axes by `max(h, w)`, recovering true original-pixel coords
+    inside the valid letterboxed region. Then clip to the image's real bounds
+    and drop boxes that collapse to zero area (they fell in the pad).
+    """
+    max_per = [int(max(int(s[0]), int(s[1]))) for s in orig_sizes_hw]
+    max_dims = torch.tensor([[m, m] for m in max_per], dtype=torch.long, device=device)
+    res = image_processor.post_process_object_detection(
+        outputs, threshold=threshold, target_sizes=max_dims,
+    )
+    cleaned: List[Dict[str, torch.Tensor]] = []
+    for i, dets in enumerate(res):
+        oh = int(orig_sizes_hw[i][0])
+        ow = int(orig_sizes_hw[i][1])
+        b = dets["boxes"]
+        if b.numel() == 0:
+            cleaned.append(dets)
+            continue
+        x1 = b[:, 0].clamp(0, ow)
+        y1 = b[:, 1].clamp(0, oh)
+        x2 = b[:, 2].clamp(0, ow)
+        y2 = b[:, 3].clamp(0, oh)
+        keep = (x2 > x1) & (y2 > y1)
+        cleaned.append({
+            "boxes":  torch.stack([x1, y1, x2, y2], dim=1)[keep],
+            "scores": dets["scores"][keep],
+            "labels": dets["labels"][keep],
+        })
+    return cleaned
+
+
 # --------- 1. sample predictions ----------
 class SamplePredictionsCallback(TrainerCallback):
     """Every K epochs, log annotated predictions on a fixed pool of val images."""
@@ -136,9 +179,10 @@ class SamplePredictionsCallback(TrainerCallback):
             sample = self.val_ds[idx]
             pix = sample["pixel_values"].unsqueeze(0).to(device)
             outputs = model(pixel_values=pix)
-            tgt_sz = torch.tensor([[orig.height, orig.width]], device=device)
-            res = self.image_processor.post_process_object_detection(
-                outputs, threshold=self.score_thresh, target_sizes=tgt_sz)[0]
+            res = _post_process_padded(
+                outputs, self.image_processor, self.score_thresh,
+                [torch.tensor([orig.height, orig.width])], device,
+            )[0]
             annotated = _draw_boxes_pil(
                 orig.copy(),
                 res["boxes"].cpu().numpy(),
@@ -206,9 +250,11 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
         for batch in loader:
             pix = batch["pixel_values"].to(device, non_blocking=True)
             outputs = model(pixel_values=pix)
-            tgt_sz = torch.stack([_orig_size_from_label(lab).to(device) for lab in batch["labels"]])
-            res = self.image_processor.post_process_object_detection(
-                outputs, threshold=self.score_thresh, target_sizes=tgt_sz)
+            orig_sizes = [_orig_size_from_label(lab) for lab in batch["labels"]]
+            res = _post_process_padded(
+                outputs, self.image_processor, self.score_thresh,
+                orig_sizes, device,
+            )
             for i, dets in enumerate(res):
                 img_id = int(batch["labels"][i]["image_id"].item())
                 boxes = dets["boxes"].cpu().numpy()
@@ -475,22 +521,26 @@ class EndOfRunArtifactsCallback(TrainerCallback):
         for batch in loader:
             pix = batch["pixel_values"].to(device, non_blocking=True)
             outputs = model(pixel_values=pix)
-            tgt_sz = torch.stack([_orig_size_from_label(lab).to(device) for lab in batch["labels"]])
-            res = ev.image_processor.post_process_object_detection(
-                outputs, threshold=score_thresh, target_sizes=tgt_sz)
+            orig_sizes = [_orig_size_from_label(lab) for lab in batch["labels"]]
+            res = _post_process_padded(
+                outputs, ev.image_processor, score_thresh, orig_sizes, device,
+            )
             for i, dets in enumerate(res):
                 lab = batch["labels"][i]
                 gt_classes = lab.get("class_labels")
-                gt_boxes = lab.get("boxes")  # cxcywh normalized; convert to xyxy in resized space
+                gt_boxes = lab.get("boxes")  # cxcywh normalized in the padded S×S frame
                 if gt_classes is None or gt_classes.numel() == 0:
                     continue
-                # Convert GT boxes from cxcywh-normalized (target_size) to xyxy in orig image coords.
-                # We don't have the resized HxW here, so use orig_size and assume processor preserved aspect.
-                orig_h, orig_w = _orig_size_from_label(lab).tolist()
+                # GT boxes live in [0,1] of the padded S×S frame (see CocoDetDataset
+                # bottom-right pad + rescale). Match the prediction post-process by
+                # scaling both axes by max(orig_h, orig_w) so predictions and GT live
+                # in the same true-original-pixel space; IoU is then meaningful.
+                orig_h, orig_w = (int(v) for v in _orig_size_from_label(lab).tolist())
+                max_dim = float(max(orig_h, orig_w))
                 cx, cy, w, h = gt_boxes.unbind(-1)
                 gt_xyxy = torch.stack([
-                    (cx - w / 2) * orig_w, (cy - h / 2) * orig_h,
-                    (cx + w / 2) * orig_w, (cy + h / 2) * orig_h,
+                    (cx - w / 2) * max_dim, (cy - h / 2) * max_dim,
+                    (cx + w / 2) * max_dim, (cy + h / 2) * max_dim,
                 ], dim=-1)
                 pred_xyxy = dets["boxes"].cpu()
                 pred_cls = dets["labels"].cpu()

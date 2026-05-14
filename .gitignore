@@ -39,6 +39,7 @@ pip-delete-this-directory.txt
 fo_mongo/
 wandb/
 runs/
+logs/
 
 # Unit test / coverage reports
 htmlcov/
@@ -66,7 +67,7 @@ model/
 datasets/
 
 # Django stuff:
-*.log
+#*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

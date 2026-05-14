@@ -59,6 +59,67 @@ def resolve_path(fn:str, val_img_dirs: List[str]) -> Path:
         if p.exists(): return p
     return Path(fn)
 
+
+def _letterbox_pad(im: Image.Image, proc) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """Mirror CocoDetDataset's input pipeline: processor letterbox + bottom-right
+    pad to a fixed S×S square. The training model was only ever shown S×S
+    inputs; running inference on raw variable-aspect tensors yields a
+    distribution-shifted input and degrades mAP for non-square images.
+
+    Returns (pixel_values of shape (1, 3, S, S), (orig_h, orig_w)).
+    """
+    target_size = Config.IMAGE_SIZE.get(
+        "longest_edge", Config.IMAGE_SIZE.get("height", 640),
+    )
+    out = proc(images=im, return_tensors="pt", size=Config.IMAGE_SIZE)
+    pv = out["pixel_values"]  # (1, 3, H, W)
+    H, W = pv.shape[-2], pv.shape[-1]
+    if H != target_size or W != target_size:
+        padded = torch.zeros(pv.shape[0], pv.shape[1], target_size, target_size, dtype=pv.dtype)
+        padded[:, :, :H, :W] = pv
+        pv = padded
+    return pv, (im.height, im.width)
+
+
+def _post_process_padded(outputs, proc, threshold: float,
+                         orig_sizes_hw, device) -> List[Dict[str, torch.Tensor]]:
+    """Counterpart to `train.wandb_callbacks._post_process_padded`.
+
+    The training dataset pads every letterboxed image to a fixed S×S square,
+    so the model's [0,1] outputs live in the padded square's frame — NOT the
+    original (h, w). Calling post_process with `target_sizes=(orig_h, orig_w)`
+    squashes predictions along the shorter axis by min/max and tanks mAP for
+    every non-square image. Fix: scale by `(max_dim, max_dim)` so post_process
+    recovers true original-pixel coords inside the valid letterboxed region,
+    then clip to real bounds and drop boxes that collapsed to zero area
+    (predictions that fell entirely in the pad).
+    """
+    max_per = [int(max(int(s[0]), int(s[1]))) for s in orig_sizes_hw]
+    max_dims = torch.tensor([[m, m] for m in max_per], dtype=torch.long, device=device)
+    res = proc.post_process_object_detection(
+        outputs, threshold=threshold, target_sizes=max_dims,
+    )
+    cleaned: List[Dict[str, torch.Tensor]] = []
+    for i, dets in enumerate(res):
+        oh = int(orig_sizes_hw[i][0])
+        ow = int(orig_sizes_hw[i][1])
+        b = dets["boxes"]
+        if b.numel() == 0:
+            cleaned.append(dets)
+            continue
+        x1 = b[:, 0].clamp(0, ow)
+        y1 = b[:, 1].clamp(0, oh)
+        x2 = b[:, 2].clamp(0, ow)
+        y2 = b[:, 3].clamp(0, oh)
+        keep = (x2 > x1) & (y2 > y1)
+        cleaned.append({
+            "boxes":  torch.stack([x1, y1, x2, y2], dim=1)[keep],
+            "scores": dets["scores"][keep],
+            "labels": dets["labels"][keep],
+        })
+    return cleaned
+
+
 def infer_images(img_paths: List[str],
                  model_dir: str = None,
                  threshold=0.3,
@@ -77,10 +138,13 @@ def infer_images(img_paths: List[str],
     outs = []
     for p in img_paths:
         im = Image.open(p).convert("RGB")
-        inputs = proc(images=im, return_tensors="pt").to(Config.DEVICE)
+        pv, orig_hw = _letterbox_pad(im, proc)
+        pv = pv.to(Config.DEVICE)
         with torch.no_grad():
-            out = model(**inputs)
-        res = proc.post_process_object_detection(out, target_sizes=torch.tensor([(im.height, im.width)]).to(device), threshold=threshold)[0]
+            out = model(pixel_values=pv)
+        res = _post_process_padded(
+            out, proc, threshold, [torch.tensor(orig_hw)], Config.DEVICE,
+        )[0]
         outs.append((p, res))
     return outs
 
@@ -105,7 +169,15 @@ def coco_eval(model_dir: str, val_img_dirs: List[str], val_json: str = None):
     # 2. Load COCO val annotations
     coco = COCO(str(val_json))
 
-    # 3. Get image ids and run inference
+    # 3. Build the dense-index -> original-COCO-cat-id map. CocoDetDataset
+    #    builds it as `enumerate(sorted(cats, key=id))`, so we mirror that here.
+    #    The model emits dense [0, K) class indices; pycocotools matches on the
+    #    original sparse category_id space — feeding dense indices directly is
+    #    a silent label-space mismatch that collapses every metric to ~zero.
+    cat_ids_sorted = sorted(coco.cats.keys())
+    idx_to_cat_id = {i: cid for i, cid in enumerate(cat_ids_sorted)}
+
+    # 4. Get image ids and run inference
     img_ids = coco.getImgIds()
     results = []
     for iid in img_ids:
@@ -114,22 +186,24 @@ def coco_eval(model_dir: str, val_img_dirs: List[str], val_json: str = None):
         # Get the full image path
         p = resolve_path(im_info["file_name"], val_img_dirs)
 
-        # Convert the image to RGB and run inference
+        # Convert the image to RGB and run inference (letterbox + S×S pad to
+        # match the training input distribution exactly).
         im = Image.open(p).convert("RGB")
-        inputs = proc(images=im, return_tensors="pt").to(Config.DEVICE)
-        with torch.inference.no_grad():
-            out = model(**inputs)
+        pv, orig_hw = _letterbox_pad(im, proc)
+        pv = pv.to(Config.DEVICE)
+        with torch.no_grad():
+            out = model(pixel_values=pv)
 
-        det = proc.post_process_object_detection(out,
-                                                 target_sizes=torch.tensor([(im.height, im.width)]).to(Config.DEVICE),
-                                                 threshold=0.0)[0]
+        det = _post_process_padded(
+            out, proc, 0.0, [torch.tensor(orig_hw)], Config.DEVICE,
+        )[0]
         # Convert to COCO json
         for s, l, b in zip(det["scores"].cpu().tolist(), det["labels"].cpu().tolist(), det["boxes"].cpu().tolist()):
-            x1,y1,x2,y2 = b
+            x1, y1, x2, y2 = b
             results.append({
                 "image_id": iid,
-                "category_id": int(l),
-                "bbox": [x1, y1, x2-x1, y2-y1], # COCO format: top-left point (x,y), width, height
+                "category_id": int(idx_to_cat_id.get(int(l), int(l))),
+                "bbox": [x1, y1, x2 - x1, y2 - y1], # COCO format: top-left point (x,y), width, height
                 "score": float(s),
             })
 
