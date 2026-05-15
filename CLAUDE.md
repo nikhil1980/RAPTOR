@@ -14,10 +14,12 @@ RAPTOR is a real-time open-vocabulary object detection system combining:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install "torch>=2.2" torchvision --extra-index-url https://download.pytorch.org/whl/cu121
+pip install "torch>=2.6" torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 huggingface-cli login  # Required: accept DINOv3 license gate
 ```
+
+**Torch floor is `>=2.6`** — `transformers>=4.51` enforces `check_torch_load_is_safe()` (CVE-2025-32434) before loading any `.pt` file. `model.safetensors` is unaffected, but `optimizer.pt` / `scheduler.pt` blocks resume from a checkpoint on torch <2.6. Failure surface: `ValueError: Due to a serious vulnerability issue in torch.load, ...` inside `trainer._load_optimizer_and_scheduler` on the *second* launch (the first run trains and writes checkpoints fine; resume is what breaks).
 
 ## Common Commands
 
@@ -72,6 +74,28 @@ Three places must agree on what a class index means:
 
 A mismatch shows up as `IndexKernel.cu:93: index out of bounds` from somewhere deep inside the matcher (often inside `generalized_box_iou`'s box-validity check, because CUDA errors are async/deferred). Set `CUDA_LAUNCH_BLOCKING=1` to get a non-deferred trace at the real failing line.
 
+### Padded-frame coordinate convention (gotcha)
+`CocoDetDataset.__getitem__` letterboxes via the RTDetr processor then **bottom-right pads to a fixed S×S square** (`Config.IMAGE_SIZE.longest_edge`, currently 640) and rescales GT boxes by `(W/S, H/S)`. After this, **every consumer downstream of the model** — GT boxes for the loss, model predictions, IoU computations, post_process targets — operates in [0,1] of the **padded S×S frame**, NOT the original image.
+
+This means the natural-looking call `RTDetrImageProcessor.post_process_object_detection(target_sizes=(orig_h, orig_w))` is **wrong** here: post_process scales [0,1] outputs by the target_sizes, but for non-square originals it squashes predictions along the shorter axis by `min(h,w)/max(h,w)` (a 16:9 image gets squashed to 56% along x). Train_loss and eval_loss stay healthy (they run in the same padded frame, fully self-consistent), but every reported mAP collapses to ~1% with `map_small ≈ 0` and a non-monotonic "convex" curve as predictions sharpen *inside* the wrong frame.
+
+**Correct pattern** (codified by `_post_process_padded` — duplicated across `train/wandb_callbacks.py`, `eval/eval_and_infer.py`, and `serve/predictor.py`):
+1. Per-image, compute `max_dim = max(orig_h, orig_w)`.
+2. Call `post_process_object_detection(target_sizes=[(max_dim, max_dim), ...])` so both axes are scaled by the longer original side (recovers true original-pixel coords inside the letterboxed region).
+3. Clip boxes to `[0, orig_w] × [0, orig_h]` and drop zero-area boxes (predictions that fell entirely in the padded region).
+
+Anything that runs inference at eval/serve time **must also reproduce the dataset's input pad** (`_letterbox_pad` in `eval/eval_and_infer.py` and `serve/predictor.py`). Feeding raw variable-aspect tensors to the model is a distribution shift the model was never trained on. The helper is intentionally duplicated across the three files rather than imported from `train.wandb_callbacks` to keep `eval/` and `serve/` independent of W&B.
+
+`EndOfRunArtifactsCallback._log_confusion_pairs` also rescales **GT** cxcywh → xyxy by `(max_dim, max_dim)` (not `(orig_w, orig_h)`) so prediction-side IoU and GT-side IoU live in the same true-pixel frame. If you ever fix one side without the other, IoU drops to zero everywhere and confusion stats vanish.
+
+Related: `eval/eval_and_infer.py` must also translate model output indices from the dense `[0, K)` space to the original COCO `category_id` space before submitting to pycocotools (see "Class-label space" above). It builds `idx_to_cat_id = {i: cid for i, cid in enumerate(sorted(coco.cats.keys()))}` mirroring `CocoDetDataset`. Forgetting this collapses every metric to ~0 even with correct boxes — same visible failure as the coordinate bug, different root cause.
+
+Failure signatures (any one of these means the coordinate or class-id mapping is broken; do not assume the model is the problem):
+- `val/coco/map_50` near zero despite falling `eval_loss`
+- `map_50` only ~1.5× `map_75` instead of the usual 3–4× — predictions are the wrong *shape* before they're at the wrong location
+- `map_small ≪ map_large` with both still tiny — small objects can't survive the coordinate squish
+- All three of `ap_rare`, `ap_common`, `ap_frequent` collapsing together — confirms it's geometry, not class imbalance
+
 ### Tunable env knobs (training)
 | Env var | Default | What it controls |
 |---------|---------|------------------|
@@ -101,8 +125,9 @@ A mismatch shows up as `IndexKernel.cu:93: index out of bounds` from somewhere d
 Two-stage detection via `Predictor.predict()`:
 1. **Closed-set**: RT-DETR head → boxes + labels filtered by `CLOSED_SCORE_THRESH` (0.30) + per-label NMS
 2. **Open-vocab**: Global image-CLIP similarity shortlists lexicon to top-200, then each box crop is embedded and matched against text embeddings above `OPEN_SCORE_THRESH` (0.28 cosine sim)
-- `ClipHelper`: OpenCLIP `ViT-L-14` wrapper for text/image encoding
+- `ClipHelper`: OpenCLIP `ViT-L-14` wrapper for text/image encoding — instantiated with `model_name=Config.CLIP_MODEL`, `pretrained=Config.CLIP_SOURCE`. Missing either of those positional args is a runtime `TypeError` exercised only when `use_openclip=True` (the default).
 - Results from both paths are merged and deduplicated
+- `_closed_set_detect` uses the dataset-matching `_letterbox_pad` + `_post_process_padded` helpers — see "Padded-frame coordinate convention (gotcha)" above. The OV path depends on this: it crops `image` with the box from the closed path before feeding to CLIP, so a squashed box samples the wrong region and silently poisons every OV label.
 
 ### Key Thresholds (`serve/predictor.py`)
 - `CLOSED_SCORE_THRESH = 0.30`
@@ -111,5 +136,5 @@ Two-stage detection via `Predictor.predict()`:
 - `TOPK_CLIP_LEXICON = 200`
 
 ### Evaluation (`eval/`)
-- `eval_and_infer.py`: Runs inference on val set, computes COCO mAP@0.5:0.95 + LVIS APr/APc/APf, saves PR plots
+- `eval_and_infer.py`: Runs inference on val set, computes COCO mAP@0.5:0.95 + LVIS APr/APc/APf, saves PR plots. Uses local `_letterbox_pad` + `_post_process_padded` (see "Padded-frame coordinate convention (gotcha)" above) so eval matches the training input pipeline exactly. Translates dense `[0, K)` model output indices back to original COCO `category_id` via `idx_to_cat_id` before submitting to pycocotools.
 - `zero_shot_prompt.py`: Demo script for OV inference on single images with user-supplied prompts

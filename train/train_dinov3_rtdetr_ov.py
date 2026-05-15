@@ -58,9 +58,9 @@ Training script for DINOv3 + RTDETR on custom MoD (mixture of data).
 To run:
 
 # Open a tmux session, run the process and exit the session (CTRL + B then D)
-tmux new -s  raptor   
+tmux new -s raptor   
 
-- ulimit -n 1048576 added.
+ulimit -n 1048576 added.
 
 export WANDB_PROJECT=RAPTOR
 export RAPTOR_WANDB_PROJECT="raptor-dinov3-rtdetr"
@@ -81,7 +81,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export RAPTOR_TRAIN_AUTO_RESUME=true
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True      
                                                                                                          
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python train/train_dinov3_rtdetr_ov.py --config-file config.json > logs/train.log 2>&1
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python train/train_dinov3_rtdetr_ov.py --config-file config.json > logs/train.log 2>&1
 
 tmux attach -t raptor 
 """
