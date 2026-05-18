@@ -384,7 +384,7 @@ class BackboneUnfreezeCallback(TrainerCallback):
 
     @staticmethod
     def _blocks(body):
-        for path in ("encoder.layer", "encoder.layers", "blocks", "layers"):
+        for path in ("encoder.layer", "encoder.layers", "model.layer", "model.layers", "blocks", "layers"):
             obj = body
             try:
                 for part in path.split("."):

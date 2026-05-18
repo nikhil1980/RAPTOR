@@ -59,29 +59,30 @@ To run:
 
 # Open a tmux session, run the process and exit the session (CTRL + B then D)
 tmux new -s raptor   
-
-ulimit -n 1048576 added.
+ulimit -n 1048576
 
 export WANDB_PROJECT=RAPTOR
 export RAPTOR_WANDB_PROJECT="raptor-dinov3-rtdetr"
-export RAPTOR_WANDB_RUN_NAME="12ep-bs48-bf16-a6000-fixed-eval"
-export RAPTOR_TRAIN_BATCH_SIZE=48 
-export RAPTOR_TRAIN_VAL_BATCH_SIZE=24 
-export RAPTOR_TRAIN_ACCUM_STEPS=1 
+export RAPTOR_WANDB_RUN_NAME="12ep-bs48-bf16-a6000-unfreeze-fix"
+export RAPTOR_TRAIN_BATCH_SIZE=48
+export RAPTOR_TRAIN_VAL_BATCH_SIZE=24
+export RAPTOR_TRAIN_ACCUM_STEPS=1
 export RAPTOR_TRAIN_EPOCHS=12
 export RAPTOR_ACCELERATE_NUM_PROCESSES=12
-export RAPTOR_EVAL_BATCH_SIZE=24                    
-                                                                                                                        
-# OPTIONAL: scale LR up slightly to compensate for 3× larger batch.
-# Standard sqrt-scaling: 2e-4 × sqrt(3) ≈ 3.5e-4. Or keep conservative at 2e-4.
+export RAPTOR_EVAL_BATCH_SIZE=24
 
 export RAPTOR_TRAIN_LEARNING_RATE=3e-4
 export RAPTOR_TRAIN_GRADIENT_CHECKPOINTING=true
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export RAPTOR_TRAIN_AUTO_RESUME=true
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True      
-                                                                                                         
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python train/train_dinov3_rtdetr_ov.py --config-file config.json > logs/train.log 2>&1
+
+# NEW: select best checkpoint by mAP, not eval_loss
+export RAPTOR_TRAIN_METRIC_FOR_BEST="eval_val/coco/map"
+export RAPTOR_TRAIN_GREATER_IS_BETTER=true
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+  python train/train_dinov3_rtdetr_ov.py --config-file config.json \
+  > logs/train.log 2>&1 
 
 tmux attach -t raptor 
 """
