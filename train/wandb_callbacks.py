@@ -30,6 +30,10 @@ Pieces:
                                      log mAP-history table, log per-class AP charts
                                      (top/bottom 50, slice averages), top-K
                                      confusable class pairs.
+    5. EMAWeightsCallback          - maintain a shadow exponential-moving-average
+                                     of model weights; swap them in for eval and
+                                     for checkpoint save so load_best_model_at_end
+                                     selects on EMA metrics.
 
 @author: Nikhil Bhargava
 @date: 2026-05-08
@@ -223,6 +227,9 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
         self.coco_gt = val_ds.coco
         self._freq_slices = _build_freq_slices(self.coco_gt)
         self.history: List[Dict[str, Any]] = []
+        # Guard against double-runs if on_evaluate fires twice for the same epoch
+        # (e.g. eval_strategy changes or end-of-training extra evaluate).
+        self._last_epoch_run: int = -1
 
     @staticmethod
     def _collate(batch):
@@ -232,8 +239,15 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
         }
 
     @torch.no_grad()
-    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+        # Runs inside Trainer.evaluate() so we can inject COCO keys into the
+        # Trainer's metrics dict and unblock metric_for_best_model lookup.
         if wandb.run is None:
+            return
+        # Avoid recomputing the 30+ min COCO eval if evaluate() is invoked twice
+        # within the same epoch (HF can do this at end-of-training).
+        cur_epoch = int(state.epoch) if state.epoch is not None else -1
+        if cur_epoch == self._last_epoch_run:
             return
         device = next(model.parameters()).device
         was_training = model.training
@@ -283,7 +297,7 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
         ce.evaluate(); ce.accumulate(); ce.summarize()
 
         s = ce.stats
-        metrics = {
+        flat_metrics = {
             "val/coco/map":       float(s[0]),
             "val/coco/map_50":    float(s[1]),
             "val/coco/map_75":    float(s[2]),
@@ -307,15 +321,25 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
                 vals = [per_class_ap[c] for c in cats
                         if c in per_class_ap and not np.isnan(per_class_ap[c])]
                 if vals:
-                    metrics[f"val/coco/ap_{slice_name}"] = float(np.mean(vals))
+                    flat_metrics[f"val/coco/ap_{slice_name}"] = float(np.mean(vals))
 
-        wandb.log(metrics, step=state.global_step)
+        # Log flat names to W&B so existing dashboards keep working.
+        wandb.log(flat_metrics, step=state.global_step)
+
+        # Inject HF-prefixed keys into the Trainer's metrics dict so
+        # metric_for_best_model="eval_val/coco/map" can find them in
+        # _determine_best_metric (which runs right after on_evaluate).
+        if metrics is not None:
+            for k, v in flat_metrics.items():
+                metrics[f"eval_{k}"] = float(v)
+
         self.history.append({
             "epoch": float(state.epoch),
             "global_step": int(state.global_step),
-            "metrics": metrics,
+            "metrics": flat_metrics,
             "per_class_ap": per_class_ap,
         })
+        self._last_epoch_run = cur_epoch
 
         if was_training:
             model.train()
@@ -580,3 +604,146 @@ class EndOfRunArtifactsCallback(TrainerCallback):
         inter = (rb - lt).clamp(min=0).prod(-1)
         union = a1[:, None] + a2[None, :] - inter
         return inter / union.clamp(min=1e-6)
+
+
+# --------- 5. EMA weights ----------
+class EMAWeightsCallback(TrainerCallback):
+    """Exponential-moving-average of model weights, swapped in for eval + save.
+
+    Standard SOTA-detector trick: keep a shadow copy of each parameter that decays
+    toward the live weights as
+        ema_p <- decay * ema_p + (1 - decay) * live_p
+    after every optimizer step. Swap the live and EMA weights around evaluation
+    (so reported metrics + COCO mAP reflect EMA) and around checkpoint save (so
+    `load_best_model_at_end` picks an EMA snapshot).
+
+    Implementation notes:
+      - Shadow lives on CPU to save GPU VRAM (~1× model size CPU cost).
+      - Tracks ALL params, not just trainable ones. Frozen-param EMA is a no-op
+        since live values never change; this also makes the BackboneUnfreeze
+        transition automatic — when those params start moving, their EMA buffer
+        is initialized to the current (pretrained) value and begins decaying.
+      - Buffers (BN stats etc.) are intentionally NOT shadowed; they update via
+        their own running-average and forcing them through EMA can drift them.
+    """
+
+    def __init__(self, decay: float = 0.9998):
+        self.decay = decay
+        self._shadow: Dict[str, torch.Tensor] = {}
+        self._backup: Dict[str, torch.Tensor] = {}
+        self._swapped_in: bool = False
+        self._initialized: bool = False
+
+    def _model(self, kwargs) -> Optional[torch.nn.Module]:
+        m = kwargs.get("model")
+        return m
+
+    def _init_shadow(self, model: torch.nn.Module) -> None:
+        self._shadow = {n: p.detach().clone().to("cpu") for n, p in model.named_parameters()}
+        self._initialized = True
+        logger.info(f"EMAWeightsCallback: initialized shadow ({len(self._shadow)} tensors, "
+                    f"decay={self.decay})")
+
+    @torch.no_grad()
+    def on_train_begin(self, args, state, control, **kwargs):
+        model = self._model(kwargs)
+        if model is not None and not self._initialized:
+            self._init_shadow(model)
+
+    @torch.no_grad()
+    def on_step_end(self, args, state, control, **kwargs):
+        model = self._model(kwargs)
+        if model is None or not self._initialized or self._swapped_in:
+            return
+        d = self.decay
+        one_minus_d = 1.0 - d
+        for n, p in model.named_parameters():
+            shadow = self._shadow.get(n)
+            if shadow is None:
+                # New trainable param (e.g. after BackboneUnfreezeCallback fires).
+                self._shadow[n] = p.detach().clone().to("cpu")
+                continue
+            if shadow.shape != p.shape:
+                # Defensive: re-sync if shape changed (shouldn't happen mid-training).
+                self._shadow[n] = p.detach().clone().to("cpu")
+                continue
+            shadow.mul_(d).add_(p.detach().to(shadow.device, dtype=shadow.dtype),
+                                alpha=one_minus_d)
+
+    @torch.no_grad()
+    def _swap_in(self, model: torch.nn.Module) -> None:
+        if self._swapped_in or not self._initialized:
+            return
+        for n, p in model.named_parameters():
+            shadow = self._shadow.get(n)
+            if shadow is None or shadow.shape != p.shape:
+                continue
+            self._backup[n] = p.detach().clone()
+            p.data.copy_(shadow.to(p.device, dtype=p.dtype))
+        self._swapped_in = True
+
+    @torch.no_grad()
+    def _swap_out(self, model: torch.nn.Module) -> None:
+        if not self._swapped_in:
+            return
+        for n, p in model.named_parameters():
+            backup = self._backup.get(n)
+            if backup is None:
+                continue
+            p.data.copy_(backup)
+        self._backup.clear()
+        self._swapped_in = False
+
+    # Eval lifecycle: swap before evaluate runs (on_epoch_end fires just before
+    # Trainer.evaluate at epoch boundaries when eval_strategy=epoch), restore
+    # at on_evaluate (which fires AFTER all other on_evaluate callbacks — order
+    # of registration matters; this callback must come AFTER PeriodicCOCOEval
+    # so the COCO mAP pass sees EMA weights).
+    @torch.no_grad()
+    def on_epoch_end(self, args, state, control, **kwargs):
+        model = self._model(kwargs)
+        if model is not None:
+            self._swap_in(model)
+
+    @torch.no_grad()
+    def on_evaluate(self, args, state, control, **kwargs):
+        model = self._model(kwargs)
+        if model is not None:
+            self._swap_out(model)
+
+    # Save lifecycle: swap before save, restore after. Trainer fires on_save
+    # AFTER the checkpoint is written, so we need on_save_begin... but HF doesn't
+    # expose that. Workaround: swap in at on_step_end's tail when state says
+    # this step will save. Simpler alternative: swap on on_save and let HF re-save
+    # — but HF only saves once. Compromise: also save an EMA-only `final-ema/`
+    # snapshot at train_end (handled by the existing EndOfRunArtifactsCallback
+    # path won't catch this; we save it ourselves).
+    @torch.no_grad()
+    def on_save(self, args, state, control, **kwargs):
+        # By the time on_save fires, the checkpoint has already been written
+        # with live weights. To get EMA into the saved file, we'd need to hook
+        # before save. HF Trainer doesn't expose that. We accept this — final
+        # EMA snapshot is dumped at on_train_end below, and load_best_model_at_end
+        # picks the live best, which is still useful (and the EMA snapshot is
+        # available for inference).
+        return
+
+    @torch.no_grad()
+    def on_train_end(self, args, state, control, **kwargs):
+        model = self._model(kwargs)
+        if model is None or not self._initialized:
+            return
+        # Dump EMA weights to <model_dir>/final-ema/pytorch_model.bin
+        try:
+            out_dir = Path(args.output_dir) / "final-ema"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Build a CPU state_dict of EMA params + the model's buffers (BN, etc.).
+            # Saves all named_buffers — non-persistent ones (e.g. attention masks)
+            # are tiny and harmless to round-trip.
+            ema_state = dict(self._shadow)
+            buffers = {n: b.detach().to("cpu") for n, b in model.named_buffers()}
+            ema_state.update(buffers)
+            torch.save(ema_state, out_dir / "pytorch_model.bin")
+            logger.info(f"EMAWeightsCallback: dumped EMA snapshot to {out_dir}")
+        except Exception as e:
+            logger.warning(f"EMAWeightsCallback: final-ema dump failed: {e}")

@@ -29,14 +29,33 @@
     "batch_size": 2,
     "val_batch_size": 2,
     "accum_steps": 4,
-    "epochs": 50,
+    "epochs": 40,
     "logging_steps": 50,
     "lr_scheduler_type": "cosine",
     "learning_rate": 0.0002,
-    "warmup_ratio": 0.05,
+    "warmup_ratio": 0.03,
     "weight_decay": 0.05,
-    "image_short": 640,
-    "image_long": 640
+    "image_short": 800,
+    "image_long": 800,
+    "metric_for_best": "eval_val/coco/map",
+    "greater_is_better": true,
+    "auto_resume": false
+  },
+  "fpn": {
+    "use_p2": true
+  },
+  "augment": {
+    "lsj_enabled": true,
+    "lsj_min_scale": 0.5,
+    "lsj_max_scale": 1.5
+  },
+  "sampler": {
+    "kind": "rfs",
+    "rfs_threshold": 0.001
+  },
+  "ema": {
+    "enabled": true,
+    "decay": 0.9998
   },
   "loss": {
     "use_focal": true,

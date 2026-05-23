@@ -30,7 +30,18 @@ from train.train_dinov3_rtdetr_ov import (
     ModelWithOV,
     LongTailTrainer,
     compute_image_weights_from_json,
+    compute_rfs_image_weights_from_json,
     build_weight_vector_for_dataset,
+)
+# Eagerly import callbacks too — they're lazy-imported inside train(), so a
+# syntax error here only surfaces hours into the actual training launch. Pull
+# them in at smoke-test time as a cheap static-import gate.
+from train.wandb_callbacks import (  # noqa: F401
+    SamplePredictionsCallback,
+    PeriodicCOCOEvalCallback,
+    BackboneUnfreezeCallback,
+    EndOfRunArtifactsCallback,
+    EMAWeightsCallback,
 )
 """ User Modules """
 
@@ -149,17 +160,23 @@ def stage_check_fpn_shapes(model, device):
     pix = torch.randn(1, 3, img_size, img_size, device=device)
     with torch.no_grad():
         feats = fpn(pix)
-    _check(len(feats) == 3, f"FPN returns 3 levels (got {len(feats)})")
+    use_p2 = getattr(fpn, "use_p2", False)
+    expected_n = 4 if use_p2 else 3
+    _check(len(feats) == expected_n,
+           f"FPN returns {expected_n} levels (got {len(feats)}, use_p2={use_p2})")
 
     # Expected sizes derive from the backbone's patch_size (DINOv2=14, DINOv3=16, ...)
-    # Levels: lat8 = ConvTranspose 2x (exact), lat16 = identity, lat32 = stride-2 conv
-    # (off-by-one possible due to padding rounding when grid is odd).
+    # Levels with P2:  lat4 (4x upsample), lat8 (2x), lat16 (identity), lat32 (/2).
+    # Levels without:  lat8, lat16, lat32. Off-by-one tolerated when conv stride
+    # padding rounds an odd grid.
     grid = img_size // fpn.patch_size
-    expected = [
+    expected_full = [
+        ("upsample 4x   ", 4 * grid,         0),
         ("upsample 2x   ", 2 * grid,         0),
         ("identity      ", grid,             0),
-        ("downsample /2 ", (grid + 1) // 2,  1),  # tolerate +/- 1 from conv rounding
+        ("downsample /2 ", (grid + 1) // 2,  1),
     ]
+    expected = expected_full if use_p2 else expected_full[1:]
     actual_hw = []
     for (f, _), (label, h_exp, tol) in zip(feats, expected):
         h_act = f.shape[-1]
@@ -168,10 +185,12 @@ def stage_check_fpn_shapes(model, device):
         _check(f.shape[-1] == f.shape[-2], f"{label.strip()} feature is square")
         _check(abs(h_act - h_exp) <= tol, f"{label.strip()} feature near expected size")
 
-    # 2x ratio between adjacent levels is what RT-DETR's HybridEncoder actually depends on.
-    h0, h1, h2 = actual_hw
-    _check(abs(h0 / h1 - 2.0) < 0.05, f"level0/level1 ratio ~2x (got {h0/h1:.3f})")
-    _check(abs(h1 / max(h2, 1) - 2.0) < 0.15, f"level1/level2 ratio ~2x (got {h1/max(h2,1):.3f})")
+    # 2x ratio between adjacent levels is what RT-DETR's HybridEncoder depends on.
+    for i in range(len(actual_hw) - 1):
+        hi, hj = actual_hw[i], max(actual_hw[i + 1], 1)
+        tol = 0.05 if i < len(actual_hw) - 2 else 0.15
+        _check(abs(hi / hj - 2.0) < tol,
+               f"level{i}/level{i+1} ratio ~2x (got {hi/hj:.3f})")
 
     if isinstance(model, ModelWithOV):
         _check(model.text_embeds.device.type == torch.device(device).type,
@@ -246,10 +265,15 @@ def stage_eval_pass(model, val_ds, device):
 
 
 def stage_check_sampler(train_ds):
-    logger.info("[8/8] Checking class-aware sampler weights")
-    img_w = compute_image_weights_from_json(
-        Path(os.path.join(BASE_PATH, str(Config.TRAIN_JSON))), beta=0.8,
-    )
+    sampler_kind = os.getenv("RAPTOR_SAMPLER_KIND", "rfs").lower()
+    logger.info(f"[8/8] Checking class-aware sampler weights (kind={sampler_kind})")
+    train_json = Path(os.path.join(BASE_PATH, str(Config.TRAIN_JSON)))
+    if sampler_kind == "rfs":
+        img_w = compute_rfs_image_weights_from_json(
+            train_json, threshold=float(os.getenv("RAPTOR_SAMPLER_RFS_THRESHOLD", "0.001")),
+        )
+    else:
+        img_w = compute_image_weights_from_json(train_json, beta=0.8)
     w = build_weight_vector_for_dataset(train_ds, img_w)
     _check(w.numel() == len(train_ds), "weight vector aligned with dataset length")
     std_over_mean = (w.std() / w.mean()).item() if w.mean() > 0 else 0.0

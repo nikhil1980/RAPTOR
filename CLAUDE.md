@@ -82,6 +82,21 @@ If mAP **plateaus then gently regresses** in this band across 3+ consecutive epo
 ### Where training output actually lands
 When W&B is active, HF Trainer's `{'loss': ..., 'grad_norm': ..., 'learning_rate': ..., 'epoch': ...}` log lines are captured by W&B's stdout hook and land in `wandb/latest-run/files/output.log` — **not** in your shell-redirected `logs/train.log`. The redirected file still receives `[transformers] ...` notices and your own `logger.*(...)` calls (including the `BackboneUnfreezeCallback` log line and `PeriodicCOCOEvalCallback` mAP printouts), but grepping `logs/train.log` for `'loss'` mid-run will return zero matches even when training is healthy. Tail `wandb/latest-run/files/output.log` for live loss/grad_norm.
 
+### Resume-specific gotchas
+**Stale `state.best_metric` silently throws away the resumed training.** `trainer_state.json` persists `best_metric` + `best_model_checkpoint`. If you change `metric_for_best_model` or flip `greater_is_better` between runs (e.g. `eval_loss`+false → `eval_val/coco/map`+true), `_determine_best_metric` compares the new value to a leftover from the *old* metric — the comparison is nonsensical, the best-tracker never updates, and `load_best_model_at_end=True` quietly reverts to the *pre-resume* checkpoint at train end. Before any such switch, null both fields in the resume checkpoint:
+```python
+import json, pathlib
+p = pathlib.Path('runs/dinov3_rtdetr/checkpoint-<N>/trainer_state.json')
+s = json.loads(p.read_text()); s['best_metric'] = s['best_model_checkpoint'] = None
+p.write_text(json.dumps(s, indent=2))
+```
+
+**`BackboneUnfreezeCallback` on a late resume only trains the tail.** `on_epoch_begin` checks `state.epoch >= frac * num_train_epochs`. Resuming at `state.epoch=9.0` with frac=0.8 and `num_train_epochs=12` (threshold 9.6) means unfreeze fires at the *next* epoch boundary (state.epoch=10.0), leaving exactly `num_train_epochs - ceil(frac*num_train_epochs)` epochs unfrozen — at the cosine-tail LR. For a meaningful unfreeze on a resume, either lower `RAPTOR_UNFREEZE_BACKBONE_FRAC` so it fires immediately, or bump `RAPTOR_TRAIN_EPOCHS` to extend the remaining schedule.
+
+**Optimizer param-group count must match on resume.** The callback appends a 3rd `param_group` for backbone params when it fires. If a checkpoint was saved *after* the unfreeze, its `optimizer.pt` has 3 groups; the fresh optimizer HF creates at resume (backbone re-frozen at setup) has 2 → `Optimizer.load_state_dict` raises `ValueError`. If you hit this, either resume from a checkpoint saved *before* the unfreeze, or pre-unfreeze the same blocks at setup time so the fresh optimizer has 3 groups too.
+
+**`RAPTOR_ACCELERATE_NUM_PROCESSES` is a no-op under `python train/...`.** Only `accelerate launch` reads it. Setting it on a single-GPU `python` run does nothing — the dataloader path uses `RAPTOR_DATALOADER_NUM_WORKERS`.
+
 ## Architecture
 
 ### Training (`train/train_dinov3_rtdetr_ov.py`)
@@ -105,7 +120,7 @@ When W&B is active, HF Trainer's `{'loss': ..., 'grad_norm': ..., 'learning_rate
 
 ### W&B callbacks (`train/wandb_callbacks.py`)
 Attached automatically when `RAPTOR_WANDB_PROJECT_ENABLED`:
-- `PeriodicCOCOEvalCallback` — full COCO mAP every epoch. Logs `val/coco/map`, `map_50`, `map_75`, `map_small/medium/large`, `ar_100`, `ap_rare/common/frequent`. Translates dense indices → original COCO `category_id` via `val_ds.idx_to_cat_id` before `coco_gt.loadRes`.
+- `PeriodicCOCOEvalCallback` — full COCO mAP every epoch. Hooks `on_evaluate` (NOT `on_epoch_end`) so it can mutate the `metrics` dict that `Trainer._determine_best_metric` reads immediately after. Pushes flat `val/coco/map`, `map_50`, `map_75`, `map_small/medium/large`, `ar_100`, `ap_rare/common/frequent` to W&B for dashboards, AND injects the same keys with `eval_` prefix into `metrics` so `metric_for_best_model="eval_val/coco/map"` resolves. Translates dense indices → original COCO `category_id` via `val_ds.idx_to_cat_id` before `coco_gt.loadRes`. **If you ever switch the hook back to `on_epoch_end`, the Trainer never sees the COCO keys and the next run dies with `KeyError: 'eval_val/coco/map'` ~24 h in — the symptom the May 18 run hit.**
 - `SamplePredictionsCallback` — every 2 epochs, inference on a fixed pool of 8 val images, annotated PIL images to W&B.
 - `BackboneUnfreezeCallback` — at 80% of `num_train_epochs`, unfreezes last 2 DINOv3 blocks at 0.1× LR by adding them to the existing optimizer. `_blocks()` searches multiple attribute paths because HF's `DINOv3ViTModel` names its encoder `model` (not `encoder`) — the actual blocks live at `body.model.layer`, so the path list must include `model.layer` / `model.layers`. A path mismatch fails *open* with `WARNING transformer blocks not found; skipping`, sets `_unfrozen=True`, and the backbone stays frozen for the entire run; symptom is mAP plateaus in the frozen-backbone band (AP~0.06–0.08, AR_100~0.3, AR_large~0.55) and then *gently regresses* epoch-over-epoch as cosine LR decays on a frozen feature extractor. A correct unfreeze logs `unfroze last 2 blocks (34 tensors, lr=...)` — 34 = 17 trainable tensors/block × 2 blocks for ViT-B. Expect a brief **loss bump (~0.5–1.0) for ~1–2 hours** after unfreeze fires while the backbone re-adapts; not a regression.
 - `EndOfRunArtifactsCallback` — on train end, uploads `final/` as a versioned Artifact plus tables for mAP-history, top/bottom-50 per-class AP, AP-by-frequency-slice, top-30 confused pairs. `_name_for(orig_cid)` translates pycocotools' original-id keys back through `cat_id_to_idx` → `id2label`.
@@ -131,7 +146,7 @@ Two-stage `Predictor.predict()`:
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `RAPTOR_TRAIN_BF16` | `true` | bf16 over fp16. Auto-falls-back if GPU lacks bf16. fp16 destabilizes RT-DETR's focal/VFL. |
-| `RAPTOR_TRAIN_METRIC_FOR_BEST` | `eval_loss` | Best-checkpoint metric. Switch to `eval_val/coco/map` once mAP is logged. |
+| `RAPTOR_TRAIN_METRIC_FOR_BEST` | `eval_loss` | Best-checkpoint metric. `eval_val/coco/*` keys are injected into the Trainer's metrics dict by `PeriodicCOCOEvalCallback.on_evaluate` and only exist when `RAPTOR_WANDB_PROJECT_ENABLED=true`. `train()` fail-fasts at startup if the chosen metric isn't reachable; do NOT switch this to a mAP key without W&B on. |
 | `RAPTOR_TRAIN_GREATER_IS_BETTER` | `false` | `true` for mAP, `false` for loss. |
 | `RAPTOR_TRAIN_SAVE_TOTAL_LIMIT` | `3` | Max checkpoints on disk. |
 | `RAPTOR_EVAL_BATCH_SIZE` | `8` | COCO-eval inference batch size. |

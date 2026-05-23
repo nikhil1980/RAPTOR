@@ -7,11 +7,24 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import glob
-import json, math
+import json, math, random
 import time
 from pathlib import Path
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+
+# Prompt templates for SigLIP class-name embedding ensemble. Each class name
+# is embedded through all templates, L2-normalized, and averaged — standard
+# CLIP-style trick worth 1–2 mAP on rare classes essentially for free.
+PROMPT_TEMPLATES: List[str] = [
+    "a photo of a {}.",
+    "a close-up photo of a {}.",
+    "a low-resolution photo of a {}.",
+    "a high-resolution photo of a {}.",
+    "a cropped photo of a {}.",
+    "an image of a {}.",
+    "a {} in the wild.",
+]
 
 import torch, torch.nn as nn
 # Switch torch's shared-memory IPC from FD-passing to /dev/shm-backed files.
@@ -62,7 +75,7 @@ tmux new -s raptor
 ulimit -n 1048576
 
 export WANDB_PROJECT=RAPTOR
-export RAPTOR_WANDB_PROJECT="raptor-dinov3-rtdetr"
+export RAPTOR_WANDB_PROJECT="RAPTOR(RTDETR + DINOv3 + OV HEAD)"
 export RAPTOR_WANDB_RUN_NAME="12ep-bs48-bf16-a6000-unfreeze-fix"
 export RAPTOR_TRAIN_BATCH_SIZE=48
 export RAPTOR_TRAIN_VAL_BATCH_SIZE=24
@@ -79,10 +92,11 @@ export RAPTOR_TRAIN_AUTO_RESUME=true
 # NEW: select best checkpoint by mAP, not eval_loss
 export RAPTOR_TRAIN_METRIC_FOR_BEST="eval_val/coco/map"
 export RAPTOR_TRAIN_GREATER_IS_BETTER=true
+export RAPTOR_UNFREEZE_BACKBONE_FRAC=0.75
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
   python train/train_dinov3_rtdetr_ov.py --config-file config.json \
-  > logs/train.log 2>&1 
+  > logs/train.log 2>&1 &
 
 tmux attach -t raptor 
 """
@@ -98,6 +112,68 @@ BASE_PATH = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 
+# --------- Large Scale Jitter augmentation ----------
+def _apply_lsj(image: "Image.Image",
+               objects: List[Dict[str, Any]],
+               min_scale: float,
+               max_scale: float) -> Tuple["Image.Image", List[Dict[str, Any]]]:
+    """ViTDet-style large-scale jitter: random scale + crop (zoom-in) or pad (zoom-out).
+
+    Operates on PIL image + COCO-format pixel-coord bboxes BEFORE the processor's
+    aspect-preserving resize. The processor's letterbox then maps the augmented
+    image to the fixed S×S square, so the effective scale change survives.
+
+    s>=1.0 -> crop a (W/s, H/s) window from the image; boxes outside the window
+             are dropped, boxes straddling the edge are clipped (drop if w<1px
+             or h<1px after clip).
+    s<1.0  -> pad the image into a (W/s, H/s) zero canvas at a random offset;
+             box coords shift accordingly and stay valid.
+    """
+    s = random.uniform(min_scale, max_scale)
+    W, H = image.size
+    if abs(s - 1.0) < 1e-3:
+        return image, objects
+
+    if s > 1.0:
+        new_w = max(1, int(W / s))
+        new_h = max(1, int(H / s))
+        x0 = random.randint(0, max(0, W - new_w))
+        y0 = random.randint(0, max(0, H - new_h))
+        image = image.crop((x0, y0, x0 + new_w, y0 + new_h))
+        kept: List[Dict[str, Any]] = []
+        for obj in objects:
+            x, y, w, h = obj["bbox"]
+            nx = max(0.0, x - x0)
+            ny = max(0.0, y - y0)
+            nx2 = min(new_w, x - x0 + w)
+            ny2 = min(new_h, y - y0 + h)
+            nw = nx2 - nx
+            nh = ny2 - ny
+            if nw > 1.0 and nh > 1.0:
+                kept.append({
+                    "category_id": obj["category_id"],
+                    "bbox": [nx, ny, nw, nh],
+                    "area": nw * nh,
+                    "iscrowd": obj.get("iscrowd", 0),
+                })
+        return image, kept
+    else:
+        new_w = max(W + 1, int(W / s))
+        new_h = max(H + 1, int(H / s))
+        pad_x = random.randint(0, new_w - W)
+        pad_y = random.randint(0, new_h - H)
+        canvas = Image.new("RGB", (new_w, new_h), (0, 0, 0))
+        canvas.paste(image, (pad_x, pad_y))
+        shifted = [{
+            "category_id": obj["category_id"],
+            "bbox": [obj["bbox"][0] + pad_x, obj["bbox"][1] + pad_y,
+                     obj["bbox"][2], obj["bbox"][3]],
+            "area": obj.get("area", obj["bbox"][2] * obj["bbox"][3]),
+            "iscrowd": obj.get("iscrowd", 0),
+        } for obj in objects]
+        return canvas, shifted
+
+
 # --------- Dataset ----------
 class CocoDetDataset(Dataset):
     """
@@ -107,7 +183,11 @@ class CocoDetDataset(Dataset):
                  ann_json: Path,
                  img_roots: List[Path],
                  processor: RTDetrImageProcessor,
-                 id2label: Dict[int,str]):
+                 id2label: Dict[int,str],
+                 is_train: bool = False,
+                 lsj_enabled: bool = False,
+                 lsj_min_scale: float = 0.5,
+                 lsj_max_scale: float = 1.5):
         """
         Initialize the COCO Detection Dataset
 
@@ -123,6 +203,10 @@ class CocoDetDataset(Dataset):
         self.img_roots = img_roots
         self.processor = processor
         self.id2label = id2label
+        self.is_train = is_train
+        self.lsj_enabled = lsj_enabled
+        self.lsj_min_scale = lsj_min_scale
+        self.lsj_max_scale = lsj_max_scale
         all_images = self.coco.loadImgs(self.img_ids)
         # Pre-filter images whose files cannot be resolved across img_roots so
         # the DataLoader never throws FileNotFoundError mid-epoch (which kills
@@ -239,6 +323,14 @@ class CocoDetDataset(Dataset):
                 "area": a.get("area", w * h),
                 "iscrowd": a.get("iscrowd", 0),
             })
+
+        # Large-scale jitter (train-only). Applied on the raw PIL image with
+        # pixel-coord bboxes so the processor's downstream letterbox + pad still
+        # see a valid COCO-format target. Skipped for val to keep eval comparable
+        # across runs.
+        if self.is_train and self.lsj_enabled and objects:
+            image, objects = _apply_lsj(image, objects, self.lsj_min_scale, self.lsj_max_scale)
+
         target = {"image_id": int(iminfo["id"]), "annotations": objects}
 
         processed = self.processor(
@@ -311,17 +403,22 @@ class DinoV3FPNBackbone(nn.Module):
     ViTDet-style multi-scale adapter for DINOv3 ViT.
 
     DINOv3 ViT outputs a single stride-16 feature map. RT-DETR's HybridEncoder
-    needs three feature maps at strides 8 / 16 / 32. We synthesize them from
-    the last block's patch tokens with:
-        - stride 8:  ConvTranspose2d 2x  (upsample)
-        - stride 16: 1x1 Conv            (channel projection)
-        - stride 32: stride-2 3x3 Conv   (downsample)
+    consumes a list of feature maps at increasing stride. Standard 3-level config
+    is strides 8 / 16 / 32; with `use_p2=True` we synthesize an extra stride-4
+    level (P2) for small-object recall (the mAP_small lever).
+
+    Levels:
+        - stride 4   (P2, optional): two stacked ConvTranspose 2x  (4x upsample)
+        - stride 8   (P3): ConvTranspose 2x  (upsample)
+        - stride 16  (P4): 1x1 Conv          (channel projection)
+        - stride 32  (P5): stride-2 3x3 Conv (downsample)
 
     Exposes the interface RTDetrModel expects from its `backbone`:
         - forward(pixel_values, pixel_mask) -> List[(features, mask)]
         - .intermediate_channel_sizes attribute
     """
-    def __init__(self, backbone_name: str, out_channels: List[int], freeze: bool = True):
+    def __init__(self, backbone_name: str, out_channels: List[int],
+                 freeze: bool = True, use_p2: bool = False):
         super().__init__()
         from transformers import AutoModel
         self.body = AutoModel.from_pretrained(backbone_name)
@@ -332,7 +429,23 @@ class DinoV3FPNBackbone(nn.Module):
         cfg = self.body.config
         self.patch_size = cfg.patch_size
         c_in = cfg.hidden_size
-        c8, c16, c32 = out_channels
+        self.use_p2 = use_p2
+
+        if use_p2:
+            # Expect 4 channel sizes — P2..P5
+            c4, c8, c16, c32 = out_channels
+            # P2 uses two stacked 2x ConvTransposes (standard ViTDet recipe). An
+            # intermediate channel size matching c_in keeps the upsample expressive.
+            self.lat4 = nn.Sequential(
+                nn.ConvTranspose2d(c_in, c_in, kernel_size=2, stride=2),
+                nn.GroupNorm(min(32, c_in), c_in),
+                nn.GELU(),
+                nn.ConvTranspose2d(c_in, c4, kernel_size=2, stride=2),
+                nn.GroupNorm(min(32, c4), c4),
+            )
+        else:
+            c8, c16, c32 = out_channels
+            self.lat4 = None
 
         self.lat8 = nn.Sequential(
             nn.ConvTranspose2d(c_in, c8, kernel_size=2, stride=2),
@@ -357,14 +470,15 @@ class DinoV3FPNBackbone(nn.Module):
         patches = last[:, -N:, :]                       # patch tokens are last
         feat = patches.transpose(1, 2).reshape(B, -1, Hp, Wp)
 
-        f8 = self.lat8(feat)
-        f16 = self.lat16(feat)
-        f32 = self.lat32(feat)
+        levels: List[torch.Tensor] = []
+        if self.use_p2:
+            levels.append(self.lat4(feat))
+        levels.extend([self.lat8(feat), self.lat16(feat), self.lat32(feat)])
 
         if pixel_mask is None:
             pixel_mask = torch.ones((B, H, W), device=pixel_values.device, dtype=torch.bool)
         feats_and_masks = []
-        for f in (f8, f16, f32):
+        for f in levels:
             m = nn.functional.interpolate(
                 pixel_mask[None].float(), size=f.shape[-2:], mode="nearest"
             ).to(torch.bool)[0]
@@ -471,17 +585,13 @@ def binary_focal_with_logits(logits: torch.Tensor,
 
 def build_text_embeddings(class_names: List[str], device) -> torch.Tensor:
     """
-    Build text embeddings for class names using a pretrained text encoder.
+    Build text embeddings for class names via a prompt-template ensemble.
 
-    1. Loads a pretrained text encoder and tokenizer.
-    2. For each class name, constructs a prompt "a photo of a {class_name}".
-    3. Tokenizes the prompt and passes it through the text encoder to obtain embeddings.
-    4. Collects the embeddings for all class names into a single tensor.
-    5. Returns the tensor of text embeddings (shape: [num_classes, embedding_dim]).
-    6. The method uses the specified device (e.g., GPU) for computation.
-    7. The method is designed to work with a specific text encoder model.
-    8. The method handles batching of text inputs for efficiency.
-    9. The method ensures that the text embeddings are in the correct format for use in the OV head.
+    Standard CLIP-detection trick: for each class, encode through several prompt
+    templates ("a photo of a {}", "a close-up photo of a {}", ...), L2-normalize
+    each, and average. Worth ~1–2 mAP on rare classes vs a single template.
+
+    Templates live in module-level PROMPT_TEMPLATES.
 
     :param class_names: List of class names.
     :param device: Device to load the model onto (e.g., "cuda" or "cpu").
@@ -491,18 +601,23 @@ def build_text_embeddings(class_names: List[str], device) -> torch.Tensor:
     """
     tok = AutoTokenizer.from_pretrained(Config.TEXT_ENCODER)
     txtm = SiglipTextModel.from_pretrained(Config.TEXT_ENCODER).to(device).eval()
-    prompts = [f"a photo of a {name}" for name in class_names]
+    accum: Optional[torch.Tensor] = None
     with torch.no_grad():
-        inputs = tok(prompts, return_tensors="pt", padding="max_length", truncation=True).to(device)
-        out = txtm(**inputs)
-        # SigLIP pools the last (EOS-equivalent) token; fall back to it if the
-        # checkpoint exposes no pooler_output.
-        embs = out.pooler_output if out.pooler_output is not None else out.last_hidden_state[:, -1]
-    embs = embs.detach().clone()
+        for tmpl in PROMPT_TEMPLATES:
+            prompts = [tmpl.format(name) for name in class_names]
+            inputs = tok(prompts, return_tensors="pt", padding="max_length", truncation=True).to(device)
+            out = txtm(**inputs)
+            # SigLIP pools the last (EOS-equivalent) token; fall back if absent.
+            embs = out.pooler_output if out.pooler_output is not None else out.last_hidden_state[:, -1]
+            embs = nn.functional.normalize(embs, dim=-1)
+            accum = embs if accum is None else accum + embs
+        avg = accum / float(len(PROMPT_TEMPLATES))
+        avg = nn.functional.normalize(avg, dim=-1)
+    avg = avg.detach().clone()
     del txtm
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return embs
+    return avg
 
 
 # --------- Self-contained Hungarian matcher ----------
@@ -709,10 +824,18 @@ def build_processor_and_datasets():
         path = os.path.join(BASE_PATH, dir)
         img_dirs.append(path)
 
+    lsj_enabled = os.getenv("RAPTOR_AUGMENT_LSJ_ENABLED", "true").lower() in ("true", "1", "yes")
+    lsj_min = float(os.getenv("RAPTOR_AUGMENT_LSJ_MIN_SCALE", "0.5"))
+    lsj_max = float(os.getenv("RAPTOR_AUGMENT_LSJ_MAX_SCALE", "1.5"))
+
     train_ds = CocoDetDataset(Path(os.path.join(BASE_PATH, Config.TRAIN_JSON)),
                               img_dirs, #0th entry is train and 1st entry is val
                               image_processor,
-                              id2label)
+                              id2label,
+                              is_train=True,
+                              lsj_enabled=lsj_enabled,
+                              lsj_min_scale=lsj_min,
+                              lsj_max_scale=lsj_max)
 
     # Make absolute paths for img_dirs
     img_dirs = list()
@@ -723,7 +846,9 @@ def build_processor_and_datasets():
     val_ds   = CocoDetDataset(Path(os.path.join(BASE_PATH, Config.VAL_JSON)),
                               img_dirs,
                               image_processor,
-                              id2label)
+                              id2label,
+                              is_train=False,
+                              lsj_enabled=False)
 
     return image_processor, train_ds, val_ds, id2label, label2id
 
@@ -759,6 +884,42 @@ def compute_image_weights_from_json(ann_json: Path, beta: float = 1.0)-> Dict[in
             img_w[im["id"]] = 1.0
         else:
             img_w[im["id"]] = sum(class_w[c] for c in imcats) / max(1, len(imcats))
+    return img_w
+
+
+def compute_rfs_image_weights_from_json(ann_json: Path, threshold: float = 0.001) -> Dict[int, float]:
+    """LVIS-style Repeat Factor Sampling (Gupta et al., 2019).
+
+    Per-class repeat factor: r_c = max(1, sqrt(t / f_c))
+        where f_c = fraction of training images containing class c.
+    Per-image repeat factor: r_i = max over classes appearing in image i of r_c.
+
+    Images containing rare classes get sampled more often. Standard LVIS recipe;
+    works better than naive inverse-frequency on long-tailed mixtures because it
+    bounds the up-weight at 1.0 instead of going to infinity for unseen classes.
+
+    :param ann_json: Path to COCO annotations JSON.
+    :param threshold: t in the formula above; smaller -> milder repeat. LVIS uses 0.001.
+    :return: Per-image repeat factor (multiplicative weight for WeightedRandomSampler).
+    """
+    js = json.load(open(ann_json))
+    n_images = max(1, len(js["images"]))
+    img2cats: Dict[int, set] = defaultdict(set)
+    for a in js["annotations"]:
+        img2cats[a["image_id"]].add(a["category_id"])
+    cls_img_count: Dict[int, int] = defaultdict(int)
+    for cats in img2cats.values():
+        for c in cats:
+            cls_img_count[c] += 1
+    cls_rfs = {c: max(1.0, math.sqrt(threshold / (cnt / n_images)))
+               for c, cnt in cls_img_count.items()}
+    img_w: Dict[int, float] = {}
+    for im in js["images"]:
+        cats = img2cats.get(im["id"], set())
+        if not cats:
+            img_w[im["id"]] = 1.0
+        else:
+            img_w[im["id"]] = max(cls_rfs[c] for c in cats)
     return img_w
 
 
@@ -815,13 +976,19 @@ def build_model(num_labels: int,
     # Build RT-DETR with a placeholder ResNet backbone purely to size the
     # encoder's input projections. We then swap in our DINOv3 + FPN adapter,
     # matching the channel sizes the placeholder reported.
+    #
+    # P2 (stride-4) is enabled via RAPTOR_FPN_USE_P2 — small-object recall lever.
+    # With P2 on we ask ResNet for out_indices (0,1,2,3) so RT-DETR's HybridEncoder
+    # builds 4 input projections and the decoder's num_feature_levels=4.
+    use_p2 = os.getenv("RAPTOR_FPN_USE_P2", "true").lower() in ("true", "1", "yes")
+    out_indices = (0, 1, 2, 3) if use_p2 else (1, 2, 3)
     cfg = RTDetrConfig(
         num_labels=num_labels,
         id2label={i: id2label[i] for i in id2label},
         label2id=label2id,
         use_pretrained_backbone=False,                   # weights come from DINOv3 below
         backbone="resnet50",                             # placeholder for channel sizing
-        backbone_kwargs={"out_indices": (1, 2, 3)},
+        backbone_kwargs={"out_indices": out_indices},
         freeze_backbone_batch_norms=True,
 
         # ---- long-tail / focal knobs ----
@@ -831,6 +998,24 @@ def build_model(num_labels: int,
         weight_loss_vfl=Config.VFL_WEIGHT,               # 1.0 keeps VFL on; 0.0 for pure focal
         eos_coefficient=Config.EOS_COEF,                 # downweight "no object"
     )
+    # Make HybridEncoder / decoder build for 4 levels when P2 is on.
+    #   - feat_strides:        used for positional embeddings
+    #   - num_feature_levels:  used by decoder cross-attention
+    #   - encoder_in_channels: drives HybridEncoder.num_fpn_stages = len - 1
+    # All three MUST agree on level count or the encoder's FPN-PAN concat fails
+    # mid-forward (different spatial sizes on the wrong levels).
+    # Channel sizes for the placeholder ResNet50 with out_indices=(0,1,2,3) are
+    # (64, 256, 512, 1024) — actual backbone reports these and we mirror them so
+    # the encoder_input_proj layers, AIFI modules, and FPN/PAN stages are all
+    # built to match what DinoV3FPNBackbone emits after the swap.
+    if use_p2:
+        cfg.feat_strides = [4, 8, 16, 32]
+        cfg.num_feature_levels = 4
+        cfg.encoder_in_channels = [64, 256, 512, 1024]
+        # AIFI is applied to the last (smallest) feature level by default; keep
+        # that semantics — encode_proj_layers is [num_feature_levels - 1] here.
+        if hasattr(cfg, "encode_proj_layers"):
+            cfg.encode_proj_layers = [cfg.num_feature_levels - 1]
     model = RTDetrForObjectDetection(cfg)
 
     # Replace the placeholder backbone with DINOv3 ViT + ViTDet-style FPN.
@@ -839,6 +1024,7 @@ def build_model(num_labels: int,
         Config.PRETRAINED_BACKBONE,
         fpn_channels,
         freeze=Config.FREEZE_BACKBONE,
+        use_p2=use_p2,
     )
 
     # Manual activation checkpointing on RT-DETR decoder layers.
@@ -921,8 +1107,15 @@ class LongTailTrainer(Trainer):
         self.image_processor = image_processor
         self.train_ds = train_ds
         # compute weights once
-        img_w = compute_image_weights_from_json(Path(os.path.join(BASE_PATH, str(Config.TRAIN_JSON))),
-                                                beta=0.8)
+        sampler_kind = os.getenv("RAPTOR_SAMPLER_KIND", "rfs").lower()
+        train_json_path = Path(os.path.join(BASE_PATH, str(Config.TRAIN_JSON)))
+        if sampler_kind == "rfs":
+            t = float(os.getenv("RAPTOR_SAMPLER_RFS_THRESHOLD", "0.001"))
+            img_w = compute_rfs_image_weights_from_json(train_json_path, threshold=t)
+            logger.info(f"---> sampler: RFS (t={t}) <---")
+        else:
+            img_w = compute_image_weights_from_json(train_json_path, beta=0.8)
+            logger.info(f"---> sampler: inverse-frequency (beta=0.8) <---")
         self.sample_weights = build_weight_vector_for_dataset(train_ds, img_w)
 
     def get_train_dataloader(self):
@@ -982,6 +1175,7 @@ def train():
         PeriodicCOCOEvalCallback,
         BackboneUnfreezeCallback,
         EndOfRunArtifactsCallback,
+        EMAWeightsCallback,
     )
 
     wandb_enabled = os.getenv("RAPTOR_WANDB_PROJECT_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -1052,6 +1246,29 @@ def train():
     )
     logger.info(f"---> precision: {'bf16' if use_bf16 else 'fp16' if use_fp16 else 'fp32'} <---")
 
+    # Fail-fast: metric_for_best_model must be reachable by _determine_best_metric.
+    # eval_loss is emitted by Trainer.evaluate() itself; any val/coco/* metric is
+    # only injected by PeriodicCOCOEvalCallback, which is W&B-gated. A 24h run
+    # crashing on a KeyError after the first epoch boundary is otherwise the
+    # only signal that this is misconfigured.
+    _BUILTIN_BEST_METRICS = {"eval_loss", "loss"}
+    if args.metric_for_best_model not in _BUILTIN_BEST_METRICS:
+        if not wandb_enabled:
+            raise ValueError(
+                f"metric_for_best_model={args.metric_for_best_model!r} is only "
+                f"emitted by PeriodicCOCOEvalCallback, which requires "
+                f"RAPTOR_WANDB_PROJECT_ENABLED=true. Either enable W&B or set "
+                f"RAPTOR_TRAIN_METRIC_FOR_BEST=eval_loss."
+            )
+        if not args.metric_for_best_model.startswith("eval_val/coco/"):
+            raise ValueError(
+                f"metric_for_best_model={args.metric_for_best_model!r} is not "
+                f"one of the keys PeriodicCOCOEvalCallback injects "
+                f"(eval_val/coco/map, eval_val/coco/map_50, eval_val/coco/map_75, "
+                f"eval_val/coco/map_small|medium|large, eval_val/coco/ar_100, "
+                f"eval_val/coco/ap_rare|common|frequent)."
+            )
+
     # Build callbacks (only attach W&B-dependent ones if wandb is on).
     callbacks = []
     if wandb_enabled:
@@ -1083,6 +1300,13 @@ def train():
             frac_of_total=float(os.getenv("RAPTOR_UNFREEZE_BACKBONE_FRAC", "0.8")),
             num_blocks=int(os.getenv("RAPTOR_UNFREEZE_BACKBONE_BLOCKS", "2")),
             lr_multiplier=float(os.getenv("RAPTOR_UNFREEZE_BACKBONE_LR_MULT", "0.1")),
+        ))
+
+    # EMA weights — register LAST so on_evaluate swap-out fires after the COCO
+    # eval callback already finished its EMA-weighted mAP pass.
+    if os.getenv("RAPTOR_EMA_ENABLED", "true").lower() in ("true", "1", "yes"):
+        callbacks.append(EMAWeightsCallback(
+            decay=float(os.getenv("RAPTOR_EMA_DECAY", "0.9998")),
         ))
 
     trainer = LongTailTrainer(

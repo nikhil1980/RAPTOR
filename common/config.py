@@ -40,7 +40,10 @@ class Config:
     TEXT_ENCODER = "google/siglip-so400m-patch14-384"
     CLIP_MODEL =  "ViT-L-14"
     CLIP_SOURCE = "openai"
-    IMAGE_SIZE = {"shortest_edge": 640, "longest_edge": 640}
+    # 800px square — small-object recall lever for the long-tail mixture. Class attrs
+    # evaluate at import time; if you need to override per-run, set
+    # RAPTOR_TRAIN_IMAGE_SHORT / _LONG and re-bind Config.IMAGE_SIZE in main().
+    IMAGE_SIZE = {"shortest_edge": 800, "longest_edge": 800}
     FREEZE_BACKBONE = True
     USE_OV_HEAD = True
 
