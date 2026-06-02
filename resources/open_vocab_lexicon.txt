@@ -4,8 +4,14 @@
 # 1. Put one label per line (thousands are fine).
 # 2. Good sources include OpenImages class names, Visual Genome objects, LVIS categories + synonyms etc.
 # 3. Ask your QA to give images with labels
+#
+# Note on synonyms: each line is matched INDEPENDENTLY against every proposal
+# crop (the predictor wraps it as "a photo of a <label>"). For regional/Indic
+# terms that OpenCLIP knows weakly, we list both the native term AND a
+# CLIP-friendly English gloss on separate lines so whichever phrasing CLIP
+# embeds better can win. The downside is the returned label may be either form.
 
-
+# --- General OV examples ---
 stethoscope
 vinyl record
 espresso cup
@@ -15,10 +21,97 @@ martini glass
 electric scooter
 bulldozer
 wine decanter
+
+# === Indic fashion ===
+
+# --- Women's garments ---
 saree
-bindi
-leggings
-salwar
-lehenga
-dupatta
+sari
+silk saree
+saree blouse
 blouse
+choli
+lehenga
+lehenga choli
+ghagra
+ghagra choli
+salwar
+salwar kameez
+shalwar kameez
+churidar
+churidar pants
+patiala salwar
+anarkali
+anarkali suit
+kurti
+women's kurta tunic
+palazzo pants
+leggings
+dupatta
+chunni
+indian stole scarf
+petticoat
+gota patti dress
+
+# --- Men's garments ---
+kurta
+kurta pajama
+sherwani
+bandhgala
+nehru jacket
+dhoti
+veshti
+lungi
+mundu
+pyjama drawstring trousers
+indian wedding suit for men
+
+# --- Headwear ---
+turban
+sikh turban
+pagri
+safa wedding turban
+gandhi cap
+topi cap
+
+# --- Footwear ---
+jutti
+mojari
+punjabi jutti shoes
+kolhapuri chappal
+kolhapuri sandals
+indian leather sandals
+
+# --- Jewelry & adornments ---
+bangles
+glass bangles
+chudi
+kada bracelet
+mangalsutra
+mangalsutra necklace
+nath
+nose ring
+nose stud
+jhumka
+jhumka earrings
+dangle earrings
+maang tikka
+head jewelry on forehead
+payal
+anklet
+bichiya
+toe ring
+haar necklace
+choker necklace
+bajuband armlet
+kamarband waist chain
+matha patti
+
+# --- Marks & ceremonial ---
+bindi
+red bindi forehead dot
+tilak forehead mark
+sindoor vermilion in hair parting
+mehndi
+henna on hands
+henna tattoo

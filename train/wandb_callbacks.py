@@ -196,7 +196,10 @@ class SamplePredictionsCallback(TrainerCallback):
             )
             wb_imgs.append(wandb.Image(annotated, caption=f"val[{idx}] epoch={state.epoch:.1f}"))
 
-        wandb.log({"val/sample_predictions": wb_imgs}, step=state.global_step)
+        # Step omitted: HF's WandbCallback already committed at state.global_step
+        # when training-loss was logged for this step; passing step=N here would
+        # trigger "Tried to log to step N < current N+1" and drop the images.
+        wandb.log({"val/sample_predictions": wb_imgs})
         if was_training:
             model.train()
 
@@ -225,6 +228,12 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
         self.score_thresh = score_thresh
         self.num_workers = num_workers
         self.coco_gt = val_ds.coco
+        # COCO mAP only scores the top-100 detections per image (maxDets[-1]=100).
+        # Capping here keeps results identical while bounding `all_results` memory:
+        # at a low score_thresh on an uncalibrated model RT-DETR passes ~all 300
+        # queries/image, so an uncapped 61k-image val set yields ~18M dicts and
+        # OOM-kills the process inside `loadRes`/`COCOeval` (May 31 incident).
+        self.max_dets_per_image = 100
         self._freq_slices = _build_freq_slices(self.coco_gt)
         self.history: List[Dict[str, Any]] = []
         # Guard against double-runs if on_evaluate fires twice for the same epoch
@@ -271,9 +280,19 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
             )
             for i, dets in enumerate(res):
                 img_id = int(batch["labels"][i]["image_id"].item())
-                boxes = dets["boxes"].cpu().numpy()
-                scores = dets["scores"].cpu().numpy()
-                labels = dets["labels"].cpu().numpy()
+                # Keep only the top-K by score per image: COCO mAP scores at most
+                # maxDets=100 per image, so this is metric-neutral but caps the
+                # size of `all_results` (and the loadRes/COCOeval that follows).
+                scores_t = dets["scores"]
+                if scores_t.numel() > self.max_dets_per_image:
+                    topk = torch.topk(scores_t, self.max_dets_per_image).indices
+                    boxes = dets["boxes"][topk].cpu().numpy()
+                    scores = scores_t[topk].cpu().numpy()
+                    labels = dets["labels"][topk].cpu().numpy()
+                else:
+                    boxes = dets["boxes"].cpu().numpy()
+                    scores = scores_t.cpu().numpy()
+                    labels = dets["labels"].cpu().numpy()
                 for b, s, l in zip(boxes, scores, labels):
                     x1, y1, x2, y2 = b.tolist()
                     # Map dense model index -> original COCO category_id for COCO eval.
@@ -287,7 +306,23 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
                     f"{elapsed:.0f}s, {len(all_results)} predictions")
 
         if not all_results:
-            logger.warning(f"  no predictions above threshold {self.score_thresh}; skipping mAP")
+            logger.warning(f"  no predictions above threshold {self.score_thresh}; "
+                           f"reporting zeroed mAP so the run survives")
+            zero_metrics = {
+                "val/coco/map": 0.0, "val/coco/map_50": 0.0, "val/coco/map_75": 0.0,
+                "val/coco/map_small": 0.0, "val/coco/map_medium": 0.0, "val/coco/map_large": 0.0,
+                "val/coco/ar_100": 0.0, "val/coco/eval_secs": float(elapsed),
+            }
+            # Do NOT pass step=state.global_step: HF's WandbCallback has already
+            # committed at that step inside evaluate(), so wandb has advanced its
+            # internal pointer and rejects the second write as monotonicity-violating
+            # ("step N < current N+1"). Logging without an explicit step lands at
+            # the current (post-eval) step — one tick later than eval_loss in the
+            # UI, but the data is not silently dropped.
+            wandb.log(zero_metrics)
+            if metrics is not None:
+                for k, v in zero_metrics.items():
+                    metrics[f"eval_{k}"] = float(v)
             if was_training:
                 model.train()
             return
@@ -324,7 +359,11 @@ class PeriodicCOCOEvalCallback(TrainerCallback):
                     flat_metrics[f"val/coco/ap_{slice_name}"] = float(np.mean(vals))
 
         # Log flat names to W&B so existing dashboards keep working.
-        wandb.log(flat_metrics, step=state.global_step)
+        # Step is intentionally omitted — see comment on the zero-metrics path
+        # above. HF's WandbCallback already logged at state.global_step inside
+        # evaluate(); reusing that step here drops the data with the warning
+        # "Tried to log to step N that is less than the current step N+1".
+        wandb.log(flat_metrics)
 
         # Inject HF-prefixed keys into the Trainer's metrics dict so
         # metric_for_best_model="eval_val/coco/map" can find them in
@@ -361,16 +400,41 @@ class BackboneUnfreezeCallback(TrainerCallback):
         if state.epoch < self.frac * args.num_train_epochs:
             return
 
+        backbone_lr = args.learning_rate * self.lr_multiplier
+        n = self.apply_unfreeze(model, optimizer, backbone_lr, args.weight_decay)
+        if n:
+            logger.info(f"BackboneUnfreezeCallback: unfroze last {self.num_blocks} blocks "
+                        f"({n} tensors, lr={backbone_lr:.2e}) at epoch {state.epoch:.1f}")
+            if wandb.run is not None:
+                wandb.log({
+                    "backbone/unfrozen_blocks": self.num_blocks,
+                    "backbone/unfrozen_param_tensors": n,
+                    "backbone/unfreeze_epoch": float(state.epoch),
+                    "backbone/lr": backbone_lr,
+                }, step=state.global_step)
+        self._unfrozen = True
+
+    def apply_unfreeze(self, model, optimizer, backbone_lr, weight_decay):
+        """Unfreeze the last ``num_blocks`` DINOv3 blocks and append a dedicated
+        low-LR optimizer param group. Returns the count of newly-trainable
+        tensors (0 if the blocks can't be located — fail-open).
+
+        Shared by the scheduled ``on_epoch_begin`` path and the resume-time
+        reconciliation in ``LongTailTrainer.create_optimizer``: a checkpoint
+        saved after the unfreeze fired carries an extra optimizer param group,
+        so the freshly-built optimizer on resume must reproduce it or HF's
+        ``_load_optimizer_and_scheduler`` raises a param-group-count ValueError.
+        The block/param iteration order here must stay identical to the original
+        run — ``optimizer.load_state_dict`` matches saved state to params by
+        insertion order, not by name."""
         body = self._body(model)
         if body is None:
             logger.warning("BackboneUnfreezeCallback: backbone body not found; skipping")
-            self._unfrozen = True
-            return
+            return 0
         blocks = self._blocks(body)
         if not blocks:
             logger.warning("BackboneUnfreezeCallback: transformer blocks not found; skipping")
-            self._unfrozen = True
-            return
+            return 0
 
         new_params = []
         for blk in blocks[-self.num_blocks:]:
@@ -380,23 +444,13 @@ class BackboneUnfreezeCallback(TrainerCallback):
                     new_params.append(p)
 
         if new_params and optimizer is not None:
-            backbone_lr = args.learning_rate * self.lr_multiplier
             optimizer.add_param_group({
                 "params": new_params,
                 "lr": backbone_lr,
-                "weight_decay": args.weight_decay,
+                "weight_decay": weight_decay,
                 "initial_lr": backbone_lr,
             })
-            logger.info(f"BackboneUnfreezeCallback: unfroze last {self.num_blocks} blocks "
-                        f"({len(new_params)} tensors, lr={backbone_lr:.2e}) at epoch {state.epoch:.1f}")
-            if wandb.run is not None:
-                wandb.log({
-                    "backbone/unfrozen_blocks": self.num_blocks,
-                    "backbone/unfrozen_param_tensors": len(new_params),
-                    "backbone/unfreeze_epoch": float(state.epoch),
-                    "backbone/lr": backbone_lr,
-                }, step=state.global_step)
-        self._unfrozen = True
+        return len(new_params)
 
     @staticmethod
     def _body(model):
@@ -627,12 +681,30 @@ class EMAWeightsCallback(TrainerCallback):
         their own running-average and forcing them through EMA can drift them.
     """
 
-    def __init__(self, decay: float = 0.9998):
+    def __init__(self, decay: float = 0.9998, warmup_steps: int = 10_000):
+        """
+        :param decay: long-horizon decay factor (typical 0.9998).
+        :param warmup_steps: ramp the effective decay from ~0 up to `decay` over
+            this many optimizer steps. Without warmup, the shadow stays anchored
+            to the initial random init for thousands of steps (decay^t × init
+            term dominates), so evals run on a model that is mostly randomly
+            initialized and AP collapses to ~0. Standard FixMatch/MAE pattern:
+                d(t) = min(decay, (1+t) / (warmup_steps + 1 + t)).
+            At t=0, d≈0 so EMA = live. At t=warmup_steps, d ≈ 0.5. At t≫warmup
+            (and t≫1/(1-decay)), d → decay.
+        """
         self.decay = decay
+        self.warmup_steps = max(1, int(warmup_steps))
         self._shadow: Dict[str, torch.Tensor] = {}
         self._backup: Dict[str, torch.Tensor] = {}
         self._swapped_in: bool = False
         self._initialized: bool = False
+
+    def _current_decay(self, step: int) -> float:
+        # Monotonically increasing toward self.decay; clipped above by it so the
+        # asymptote never overshoots the configured long-horizon value.
+        ramp = (1.0 + step) / (self.warmup_steps + 1.0 + step)
+        return min(self.decay, ramp)
 
     def _model(self, kwargs) -> Optional[torch.nn.Module]:
         m = kwargs.get("model")
@@ -642,7 +714,7 @@ class EMAWeightsCallback(TrainerCallback):
         self._shadow = {n: p.detach().clone().to("cpu") for n, p in model.named_parameters()}
         self._initialized = True
         logger.info(f"EMAWeightsCallback: initialized shadow ({len(self._shadow)} tensors, "
-                    f"decay={self.decay})")
+                    f"decay={self.decay}, warmup_steps={self.warmup_steps})")
 
     @torch.no_grad()
     def on_train_begin(self, args, state, control, **kwargs):
@@ -655,7 +727,9 @@ class EMAWeightsCallback(TrainerCallback):
         model = self._model(kwargs)
         if model is None or not self._initialized or self._swapped_in:
             return
-        d = self.decay
+        # Warmup-aware decay: tracks live closely while the model is still moving
+        # fast; transitions to the long-horizon decay as training stabilizes.
+        d = self._current_decay(int(state.global_step))
         one_minus_d = 1.0 - d
         for n, p in model.named_parameters():
             shadow = self._shadow.get(n)
@@ -694,11 +768,14 @@ class EMAWeightsCallback(TrainerCallback):
         self._backup.clear()
         self._swapped_in = False
 
-    # Eval lifecycle: swap before evaluate runs (on_epoch_end fires just before
-    # Trainer.evaluate at epoch boundaries when eval_strategy=epoch), restore
-    # at on_evaluate (which fires AFTER all other on_evaluate callbacks — order
-    # of registration matters; this callback must come AFTER PeriodicCOCOEval
-    # so the COCO mAP pass sees EMA weights).
+    # Eval + save lifecycle. HF Trainer._maybe_log_save_evaluate order is:
+    #   on_epoch_end -> _evaluate (which fires on_evaluate) -> _determine_best_metric
+    #     -> _save_checkpoint -> on_save
+    # We want EMA weights active for: eval_loss computation, the COCO mAP pass,
+    # best-metric selection, AND the checkpoint file write. Then restore LIVE
+    # before the next training step.
+    #   on_epoch_end : swap IN  -> eval/COCO/save all run with EMA weights
+    #   on_save      : swap OUT -> next training step optimizes LIVE again
     @torch.no_grad()
     def on_epoch_end(self, args, state, control, **kwargs):
         model = self._model(kwargs)
@@ -707,26 +784,22 @@ class EMAWeightsCallback(TrainerCallback):
 
     @torch.no_grad()
     def on_evaluate(self, args, state, control, **kwargs):
+        # Intentionally a no-op: keep EMA weights swapped in through the save
+        # that follows on_evaluate in _maybe_log_save_evaluate, so the saved
+        # checkpoint contains EMA weights (which is what _determine_best_metric
+        # selected on). Restoration happens in on_save below.
+        return
+
+    @torch.no_grad()
+    def on_save(self, args, state, control, **kwargs):
+        # Fires AFTER _save_checkpoint writes the file. Since on_evaluate no
+        # longer swaps out, the file was written with EMA weights. Restore LIVE
+        # so the next training step optimizes the real weights. Safe if EMA was
+        # never swapped in (mid-epoch save with save_strategy=steps): _swap_out
+        # early-returns when self._swapped_in is False.
         model = self._model(kwargs)
         if model is not None:
             self._swap_out(model)
-
-    # Save lifecycle: swap before save, restore after. Trainer fires on_save
-    # AFTER the checkpoint is written, so we need on_save_begin... but HF doesn't
-    # expose that. Workaround: swap in at on_step_end's tail when state says
-    # this step will save. Simpler alternative: swap on on_save and let HF re-save
-    # — but HF only saves once. Compromise: also save an EMA-only `final-ema/`
-    # snapshot at train_end (handled by the existing EndOfRunArtifactsCallback
-    # path won't catch this; we save it ourselves).
-    @torch.no_grad()
-    def on_save(self, args, state, control, **kwargs):
-        # By the time on_save fires, the checkpoint has already been written
-        # with live weights. To get EMA into the saved file, we'd need to hook
-        # before save. HF Trainer doesn't expose that. We accept this — final
-        # EMA snapshot is dumped at on_train_end below, and load_best_model_at_end
-        # picks the live best, which is still useful (and the EMA snapshot is
-        # available for inference).
-        return
 
     @torch.no_grad()
     def on_train_end(self, args, state, control, **kwargs):

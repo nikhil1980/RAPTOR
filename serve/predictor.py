@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from PIL import Image
 import numpy as np
 
-from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
+from transformers import RTDetrForObjectDetection, RTDetrImageProcessor, RTDetrConfig
 
 """ System Modules """
 
@@ -44,6 +44,125 @@ except Exception:
 
 
 logger = get_logger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def build_and_load_trained_model(model_dir: str, device: str):
+    """Reconstruct the EXACT training-time architecture (DINOv3 ViT + ViTDet FPN
+    backbone + RT-DETR + OV head, wrapped in ``ModelWithOV``) and load the saved
+    state_dict from ``model_dir/model.safetensors``.
+
+    serve previously did ``RTDetrForObjectDetection.from_pretrained(model_dir)``,
+    which builds a vanilla ResNet-backbone RT-DETR whose keys carry no ``base.``
+    prefix and no DINOv3 / FPN / OV-head params. Against a checkpoint saved as
+    ``ModelWithOV`` (all weights prefixed ``base.*`` + ``ov_head.*``) that drops
+    EVERY trained tensor and runs on random init. We mirror ``train.build_model``
+    instead so the key names line up.
+
+    ``num_labels`` and ``use_p2`` are auto-detected from the checkpoint, so this
+    loads both the old (no-P2, 1579-class) and the SOTA (P2) checkpoints.
+    ``text_embeds`` is a non-persistent buffer the serve path never touches
+    (open-vocab runs through OpenCLIP, and ``ModelWithOV.forward`` only uses the
+    OV head when ``self.training``), so we pass zeros instead of recomputing
+    SigLIP embeddings.
+
+    The ``RTDetrConfig`` block below is replicated verbatim from
+    ``train.build_model`` — keep the two in sync if the training config changes.
+    """
+    from safetensors.torch import load_file
+    # Reuse training's parameter-defining modules so state_dict key names match
+    # exactly (importing here keeps serve's module import light + W&B-free).
+    from train.train_dinov3_rtdetr_ov import DinoV3FPNBackbone, OVHead, ModelWithOV, build_idmaps
+
+    sd_path = os.path.join(model_dir, "model.safetensors")
+    if not os.path.exists(sd_path):
+        raise FileNotFoundError(f"trained weights not found: {sd_path}")
+    state = load_file(sd_path)
+
+    # --- auto-detect architecture from the checkpoint ---
+    num_labels = int(state["base.model.decoder.class_embed.0.bias"].shape[0])
+    use_p2 = any(".backbone.lat4." in k for k in state)
+    text_dim = int(state["ov_head.proj.weight"].shape[0]) if "ov_head.proj.weight" in state else 1152
+
+    # id2label in the SAME dense ordering training used (categories sorted by id).
+    # The merged category space has drifted over time (e.g. 1579 -> 1565), so the
+    # current Config.VAL_JSON may not match a given checkpoint. Resolve the label
+    # source by category-count match instead: probe candidate jsons smallest-first
+    # (Config.VAL_JSON, then siblings in its annotations dir) so we find a matching
+    # file — including an older *.bak.json — without ever loading the multi-GB
+    # train json (it's largest, checked last, and a small match wins before then).
+    ann_dir = (_PROJECT_ROOT / Config.VAL_JSON).parent
+    candidates = [_PROJECT_ROOT / Config.VAL_JSON]
+    candidates += sorted(ann_dir.glob("*.json"), key=lambda p: p.stat().st_size)
+    labels_json, seen = None, set()
+    for p in candidates:
+        rp = p.resolve()
+        if rp in seen or not p.exists():
+            continue
+        seen.add(rp)
+        try:
+            n = len(json.load(open(p)).get("categories", []))
+        except Exception:
+            continue
+        if n == num_labels:
+            labels_json = p
+            break
+    if labels_json is None:
+        raise ValueError(
+            f"no annotations json under {ann_dir} has {num_labels} categories to "
+            f"match the checkpoint; cannot build a correctly-aligned id2label.")
+    id2label, label2id = build_idmaps(labels_json)
+    logger.info(f"---> id2label ({len(id2label)} classes) resolved from {labels_json} <---")
+
+    # --- RTDetrConfig (verbatim from train.build_model) ---
+    out_indices = (0, 1, 2, 3) if use_p2 else (1, 2, 3)
+    cfg = RTDetrConfig(
+        num_labels=num_labels,
+        id2label=dict(id2label),
+        label2id=label2id,
+        use_pretrained_backbone=False,
+        backbone="resnet50",
+        backbone_kwargs={"out_indices": out_indices},
+        freeze_backbone_batch_norms=True,
+        use_focal_loss=True,
+        focal_loss_alpha=Config.FOREGROUND_ALPHA,
+        focal_loss_gamma=Config.FOCAL_GAMMA,
+        weight_loss_vfl=Config.VFL_WEIGHT,
+        eos_coefficient=Config.EOS_COEF,
+    )
+    if use_p2:
+        cfg.feat_strides = [4, 8, 16, 32]
+        cfg.num_feature_levels = 4
+        cfg.encoder_in_channels = [64, 256, 512, 1024]
+        if hasattr(cfg, "encode_proj_layers"):
+            cfg.encode_proj_layers = [cfg.num_feature_levels - 1]
+    model = RTDetrForObjectDetection(cfg)
+
+    # Swap the placeholder ResNet for the DINOv3 ViT + ViTDet FPN (as in training).
+    fpn_channels = list(model.model.backbone.intermediate_channel_sizes)
+    model.model.backbone = DinoV3FPNBackbone(
+        Config.PRETRAINED_BACKBONE, fpn_channels,
+        freeze=Config.FREEZE_BACKBONE, use_p2=use_p2,
+    )
+
+    ov_head = OVHead(hidden_dim=model.config.d_model, text_dim=text_dim)
+    wrap = ModelWithOV(model, ov_head, torch.zeros(num_labels, text_dim))
+
+    missing, unexpected = wrap.load_state_dict(state, strict=False)
+    # text_embeds is non-persistent (excluded from both sides) -> not expected here.
+    real_missing = [k for k in missing if not k.endswith("text_embeds")]
+    if unexpected:
+        logger.warning(f"---> WEIGHT LOAD: {len(unexpected)} UNEXPECTED keys "
+                       f"(e.g. {unexpected[:3]}) <---")
+    if real_missing:
+        logger.warning(f"---> WEIGHT LOAD: {len(real_missing)} MISSING keys "
+                       f"(e.g. {real_missing[:3]}) <---")
+    logger.info(f"---> LOADED trained ModelWithOV from {sd_path}: num_labels={num_labels}, "
+                f"use_p2={use_p2}, text_dim={text_dim}; "
+                f"matched {len(state) - len(unexpected)}/{len(state)} checkpoint tensors <---")
+    return wrap.to(device).eval()
+
 
 # --------------------------------
 # Helpers: boxes, IoU, NMS, utils
@@ -135,7 +254,7 @@ def load_lexicon(path: Optional[str]) -> List[str]:
     """
     if path and Path(path).exists():
         with open(path, "r") as f:
-            labels = [ln.strip() for ln in f if ln.strip()]
+            labels = [s for ln in f if (s := ln.strip()) and not s.startswith("#")]
         return labels
     return Config.FALLBACK_LEXICON
 
@@ -293,7 +412,22 @@ class Predictor:
         :return: None
         """
         self.device = device
-        self.model = RTDetrForObjectDetection.from_pretrained(model_dir).to(device).eval()
+
+        # --- Serve-time overrides (env wins over config.py defaults; no code edit
+        #     needed to tune). Mirrors how train re-binds Config.IMAGE_SIZE in main().
+        # RAPTOR_SERVE_IMAGE_SHORT: square input edge — MUST match the checkpoint's
+        #   training resolution (e.g. 640 for the old run, 800 for the SOTA run), or
+        #   confidence drops and detections vanish.
+        serve_short = os.getenv("RAPTOR_SERVE_IMAGE_SHORT")
+        if serve_short:
+            s = int(serve_short)
+            Config.IMAGE_SIZE = {"shortest_edge": s, "longest_edge": s}
+            logger.info(f"---> serve image size set to {s}px via RAPTOR_SERVE_IMAGE_SHORT <---")
+
+        # Reconstruct the trained DINOv3 + RT-DETR + OV-head architecture and load
+        # the saved weights. (A plain RTDetrForObjectDetection.from_pretrained here
+        # silently drops every `base.*`/`ov_head.*` tensor and runs on random init.)
+        self.model = build_and_load_trained_model(model_dir, device)
         self.processor = RTDetrImageProcessor.from_pretrained(Config.RTDETR_IMAGE_PROCESSOR)
 
         # id2label from config (string keys)
@@ -305,8 +439,14 @@ class Predictor:
         # Normalize to int keys
         self.id2label = {int(k): v for k, v in id2label.items()}
 
-        self.closed_thresh = Config.CLOSED_SCORE_THRESH
-        self.open_thresh   = Config.OPEN_SCORE_THRESH
+        # RAPTOR_CLOSED_SCORE_THRESH: min RT-DETR head score for a closed-set box
+        #   (also the proposal floor for the OV path — lower it for under-calibrated
+        #   checkpoints whose confidence tops out below the 0.30 default).
+        # RAPTOR_OPEN_SCORE_THRESH: min OpenCLIP cosine for adopting an OV label.
+        self.closed_thresh = float(os.getenv("RAPTOR_CLOSED_SCORE_THRESH", Config.CLOSED_SCORE_THRESH))
+        self.open_thresh   = float(os.getenv("RAPTOR_OPEN_SCORE_THRESH", Config.OPEN_SCORE_THRESH))
+        logger.info(f"---> serve thresholds: closed={self.closed_thresh}, open={self.open_thresh} "
+                    f"(image_size={Config.IMAGE_SIZE}) <---")
 
         self.lexicon_all = load_lexicon(lexicon_path)
         self.use_openclip = use_openclip and _HAS_OPENCLIP

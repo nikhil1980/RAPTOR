@@ -72,30 +72,63 @@ To run:
 
 # Open a tmux session, run the process and exit the session (CTRL + B then D)
 tmux new -s raptor   
+
 ulimit -n 1048576
 
 export WANDB_PROJECT=RAPTOR
 export RAPTOR_WANDB_PROJECT="RAPTOR(RTDETR + DINOv3 + OV HEAD)"
-export RAPTOR_WANDB_RUN_NAME="12ep-bs48-bf16-a6000-unfreeze-fix"
-export RAPTOR_TRAIN_BATCH_SIZE=48
-export RAPTOR_TRAIN_VAL_BATCH_SIZE=24
-export RAPTOR_TRAIN_ACCUM_STEPS=1
-export RAPTOR_TRAIN_EPOCHS=12
-export RAPTOR_ACCELERATE_NUM_PROCESSES=12
-export RAPTOR_EVAL_BATCH_SIZE=24
+export RAPTOR_WANDB_RUN_NAME="sota-800-p2-lsj-rfs-ema-40ep"
 
-export RAPTOR_TRAIN_LEARNING_RATE=3e-4
+# --- batch ---
+# Prior run: 48@640 fit on a single A6000. SOTA adds 800px (~2.4x pixels) and
+# the P2 stride-4 level (~4x tokens at the smallest feature). Drop the per-GPU
+# batch and use accumulation to keep an effective batch of 32. With grad
+# checkpointing on the decoder layers this should sit comfortably under 40 GB.
+export RAPTOR_TRAIN_BATCH_SIZE=8
+export RAPTOR_TRAIN_VAL_BATCH_SIZE=4
+export RAPTOR_TRAIN_ACCUM_STEPS=4        # effective batch = 32
+export RAPTOR_EVAL_BATCH_SIZE=4
+
+# --- schedule ---
+# Frozen-backbone band runs until 0.5 * 40 = epoch 20. That leaves 20 epochs
+# of last-2-blocks fine-tune at 0.1x LR — the lever that typically delivers the
+# 30%+ mAP jump on this mixture.
+export RAPTOR_TRAIN_EPOCHS=40
+export RAPTOR_UNFREEZE_BACKBONE_FRAC=0.5
+
+# --- LR ---
+# Linear-scaling from the prior 3e-4@48 to eff=32: 3e-4 * 32/48 = 2e-4.
+# Lower also gives LSJ + P2 more stability while the new conv layers warm up.
+# Matches config.json default; leave the export here for visibility.
+export RAPTOR_TRAIN_LEARNING_RATE=2e-4
+export RAPTOR_TRAIN_WARMUP_RATIO=0.03    # ~1.2 epochs of warmup
+
+# --- precision / memory ---
+export RAPTOR_TRAIN_BF16=true
 export RAPTOR_TRAIN_GRADIENT_CHECKPOINTING=true
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export RAPTOR_TRAIN_AUTO_RESUME=true
 
-# NEW: select best checkpoint by mAP, not eval_loss
+# --- dataloader (NOT accelerate) ---
+# RAPTOR_ACCELERATE_NUM_PROCESSES is a no-op under `python train/...` (see
+# CLAUDE.md). Use the dataloader knob instead, and keep it modest at 800px to
+# avoid /dev/shm pressure from larger PIL buffers.
+export RAPTOR_DATALOADER_NUM_WORKERS=8
+
+# --- best-checkpoint selection ---
+# Selection now correctly persists EMA weights (callback fix applied today).
 export RAPTOR_TRAIN_METRIC_FOR_BEST="eval_val/coco/map"
 export RAPTOR_TRAIN_GREATER_IS_BETTER=true
-export RAPTOR_UNFREEZE_BACKBONE_FRAC=0.75
+
+# --- CRITICAL: clean restart ---
+# Architecture changed (P2 adds lat4 + an extra encoder_input_proj layer), and
+# the trainer_state from the prior 12-ep run carries a best_metric tied to the
+# old setup. Resuming would either crash on param-group mismatch or silently
+# fall back to a non-comparable checkpoint at train end.
+export RAPTOR_TRAIN_AUTO_RESUME=false
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
-  python train/train_dinov3_rtdetr_ov.py --config-file config.json \
+  /home/nikhil/miniconda3/envs/raptor/bin/python \
+  train/train_dinov3_rtdetr_ov.py --config-file config.json \
   > logs/train.log 2>&1 &
 
 tmux attach -t raptor 
@@ -357,11 +390,15 @@ class CocoDetDataset(Dataset):
         H, W = pv.shape[-2], pv.shape[-1]
         if H != target_size or W != target_size:
             padded = torch.zeros(pv.shape[0], target_size, target_size, dtype=pv.dtype)
-            padded[:, :H, :W] = pv
+            # Processor rounding can produce a dim 1px over `longest_edge` for
+            # some aspect ratios (esp. under LSJ) — clamp the copy so the pad
+            # still succeeds instead of crashing the worker.
+            h_use, w_use = min(H, target_size), min(W, target_size)
+            padded[:, :h_use, :w_use] = pv[:, :h_use, :w_use]
             processed["pixel_values"] = padded
             lab = dict(processed["labels"][0])
             if "boxes" in lab and lab["boxes"].numel() > 0:
-                sx, sy = W / target_size, H / target_size
+                sx, sy = w_use / target_size, h_use / target_size
                 boxes = lab["boxes"].clone()
                 boxes[:, 0] *= sx  # cx
                 boxes[:, 1] *= sy  # cy
@@ -1139,6 +1176,68 @@ class LongTailTrainer(Trainer):
             persistent_workers=True,
         )
 
+    def create_optimizer(self):
+        """Build the optimizer, then reconcile its param-group count with the
+        checkpoint we're resuming from (if any). HF calls this before
+        _load_optimizer_and_scheduler, which is the only window in which we can
+        add the post-unfreeze backbone group so the loaded state dict matches.
+        """
+        optimizer = super().create_optimizer()
+        self._reconcile_optimizer_for_resume(optimizer)
+        return optimizer
+
+    def _reconcile_optimizer_for_resume(self, optimizer):
+        """If resuming from a checkpoint whose optimizer carries the extra
+        backbone param group added by BackboneUnfreezeCallback (after it fired),
+        the freshly-built optimizer here has one fewer group and HF's optimizer
+        state load raises `ValueError: loaded state dict has a different number
+        of parameter groups`. Detect the count straight from the saved
+        optimizer.pt (immune to epoch off-by-one — a wrong guess in either
+        direction crashes) and replay the unfreeze to reproduce the group.
+        """
+        ckpt = getattr(self, "_resume_ckpt_dir", None)
+        if not ckpt:
+            return
+        opt_path = os.path.join(ckpt, "optimizer.pt")
+        if not os.path.exists(opt_path):
+            return
+        try:
+            saved = torch.load(opt_path, map_location="cpu", weights_only=False)
+            saved_groups = len(saved["param_groups"])
+            del saved
+        except Exception as e:  # noqa: BLE001 - best-effort; fall through to HF's load
+            logger.warning(f"resume optimizer-group reconcile: cannot read {opt_path}: {e}")
+            return
+
+        cur_groups = len(optimizer.param_groups)
+        if saved_groups <= cur_groups:
+            return  # pre-unfreeze checkpoint (or already matching) — nothing to do
+
+        unfreeze_cb = next(
+            (cb for cb in getattr(self.callback_handler, "callbacks", [])
+             if cb.__class__.__name__ == "BackboneUnfreezeCallback"),
+            None,
+        )
+        if unfreeze_cb is None:
+            logger.warning(
+                f"resume optimizer-group reconcile: saved optimizer has {saved_groups} "
+                f"param groups but the built optimizer has {cur_groups} and no "
+                f"BackboneUnfreezeCallback is attached to reconstruct the difference; "
+                f"optimizer state load will likely fail.")
+            return
+
+        backbone_lr = self.args.learning_rate * unfreeze_cb.lr_multiplier
+        n = unfreeze_cb.apply_unfreeze(self.model, optimizer, backbone_lr, self.args.weight_decay)
+        unfreeze_cb._unfrozen = True  # prevent on_epoch_begin from adding a duplicate group
+        now = len(optimizer.param_groups)
+        logger.info(
+            f"resume optimizer-group reconcile: pre-unfroze backbone ({n} tensors, "
+            f"lr={backbone_lr:.2e}); optimizer now has {now} groups to match saved {saved_groups}.")
+        if now != saved_groups:
+            logger.warning(
+                f"resume optimizer-group reconcile: group count still mismatched "
+                f"({now} built vs {saved_groups} saved) — optimizer state load may fail.")
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs)-> torch.Tensor:
         """
         Compute loss for the model.
@@ -1162,6 +1261,35 @@ class LongTailTrainer(Trainer):
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
         return (loss, outputs) if return_outputs else loss
 
+    def _find_ema_callback(self):
+        # Duck-typed lookup to avoid a hard import on EMAWeightsCallback from
+        # this module (the callback is lazy-imported inside `train()` below to
+        # keep the static-import surface small). Any callback exposing the
+        # swap-in/swap-out protocol is treated as the EMA hook.
+        for cb in getattr(self.callback_handler, "callbacks", []):
+            if (hasattr(cb, "_swap_in") and hasattr(cb, "_swap_out")
+                    and hasattr(cb, "_swapped_in")
+                    and getattr(cb, "_initialized", False)):
+                return cb
+        return None
+
+    def _save_checkpoint(self, *args, **kwargs):
+        # Guarantee checkpoint files carry EMA weights, regardless of whether
+        # this save fires at an epoch boundary (where the EMA callback's
+        # on_epoch_end has already swapped in) or mid-epoch (where it has not).
+        # Without this wrap, save_strategy=steps writes LIVE weights to disk,
+        # and load_best_model_at_end then loads LIVE weights even though the
+        # best metric was selected on an EMA-weighted eval — silent mismatch.
+        ema = self._find_ema_callback()
+        owned_swap = False
+        if ema is not None and not ema._swapped_in:
+            ema._swap_in(self.model)
+            owned_swap = True
+        try:
+            return super()._save_checkpoint(*args, **kwargs)
+        finally:
+            if owned_swap:
+                ema._swap_out(self.model)
 
 
 def train():
@@ -1224,10 +1352,19 @@ def train():
         warmup_ratio=float(os.getenv("RAPTOR_TRAIN_WARMUP_RATIO", "0.05")),
         weight_decay=float(os.getenv("RAPTOR_TRAIN_WEIGHT_DECAY", "0.05")),
         logging_steps=int(os.getenv("RAPTOR_TRAIN_LOGGING_STEPS", "25")),
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        # Strategies are env-driven (defaults preserve the per-epoch behavior).
+        # For long runs, save_strategy="steps" gives crash-safety between the
+        # expensive per-epoch COCO evals. HF requires eval_strategy==save_strategy
+        # when load_best_model_at_end=True, and per-epoch COCO eval is too costly
+        # to run as often as we'd want to checkpoint — so frequent step-saves
+        # require RAPTOR_TRAIN_LOAD_BEST=false (best checkpoint then selected
+        # offline from retained checkpoints + W&B per-epoch mAP). The
+        # _save_checkpoint wrap above ensures step-saved checkpoints carry EMA.
+        eval_strategy=os.getenv("RAPTOR_TRAIN_EVAL_STRATEGY", "epoch"),
+        save_strategy=os.getenv("RAPTOR_TRAIN_SAVE_STRATEGY", "epoch"),
+        save_steps=int(os.getenv("RAPTOR_TRAIN_SAVE_STEPS", "500")),
         save_total_limit=int(os.getenv("RAPTOR_TRAIN_SAVE_TOTAL_LIMIT", "3")),
-        load_best_model_at_end=True,
+        load_best_model_at_end=os.getenv("RAPTOR_TRAIN_LOAD_BEST", "true").lower() in ("true", "1", "yes"),
         metric_for_best_model=os.getenv("RAPTOR_TRAIN_METRIC_FOR_BEST", "eval_loss"),
         greater_is_better=os.getenv("RAPTOR_TRAIN_GREATER_IS_BETTER", "false").lower() == "true",
         bf16=use_bf16,
@@ -1303,10 +1440,13 @@ def train():
         ))
 
     # EMA weights — register LAST so on_evaluate swap-out fires after the COCO
-    # eval callback already finished its EMA-weighted mAP pass.
+    # eval callback already finished its EMA-weighted mAP pass. Warmup steps
+    # default to 10k so short subsample dry-runs (~625 steps/epoch) don't eval
+    # on a shadow that's still anchored to random init.
     if os.getenv("RAPTOR_EMA_ENABLED", "true").lower() in ("true", "1", "yes"):
         callbacks.append(EMAWeightsCallback(
             decay=float(os.getenv("RAPTOR_EMA_DECAY", "0.9998")),
+            warmup_steps=int(os.getenv("RAPTOR_EMA_WARMUP_STEPS", "10000")),
         ))
 
     trainer = LongTailTrainer(
@@ -1322,11 +1462,17 @@ def train():
     # Auto-resume from the latest checkpoint in `model_dir` if one exists.
     # Set RAPTOR_TRAIN_AUTO_RESUME=false to force a fresh run.
     auto_resume = os.getenv("RAPTOR_TRAIN_AUTO_RESUME", "true").lower() in ("true", "1", "yes")
-    ckpts = glob.glob(os.path.join(model_dir, "checkpoint-*")) if auto_resume else []
-    resume = True if ckpts else None
-    if resume:
-        logger.info(f"---> RESUMING FROM LATEST CHECKPOINT IN {model_dir} <---")
-    trainer.train(resume_from_checkpoint=resume)
+    last_ckpt = None
+    if auto_resume and os.path.isdir(model_dir):
+        from transformers.trainer_utils import get_last_checkpoint
+        last_ckpt = get_last_checkpoint(model_dir)
+    # Hand the resume checkpoint to the trainer so create_optimizer can rebuild
+    # the post-unfreeze backbone param group before HF loads the optimizer state
+    # (see LongTailTrainer._reconcile_optimizer_for_resume).
+    trainer._resume_ckpt_dir = last_ckpt
+    if last_ckpt:
+        logger.info(f"---> RESUMING FROM {last_ckpt} <---")
+    trainer.train(resume_from_checkpoint=last_ckpt)
     save_dir = os.path.join(model_dir, "final")
     os.makedirs(save_dir, exist_ok=True)
     trainer.save_model(save_dir)

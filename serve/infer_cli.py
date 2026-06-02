@@ -84,7 +84,7 @@ def main():
                 logger.info(f"---> RUNNING ZERO-SHOT INFERENCE ON IMAGE: {test_image} WITH TAGS: {test_tags} <---")
 
                 pred = Predictor(model_dir=model_dir, lexicon_path=lexicon_path, use_openclip=True)
-                result = pred.predict(args.image, general_prompts=test_tags, return_boxes=True)
+                result = pred.predict(test_image, general_prompts=test_tags, return_boxes=True)
                 
                 logger.info(f"---> ZERO-SHOT DETECTION RESULTS: {json.dumps(result, indent=4)} <---")
 

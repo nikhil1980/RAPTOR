@@ -59,8 +59,12 @@ Validates, in order:
     6. Overfit-on-one-batch: 300 steps @ lr=5e-4 must drive loss down >50%.
        This is the single best predictor of "will training learn anything";
        if it fails, do NOT launch a long run.
-    7. Eval forward pass on a val sample produces finite loss.
-    8. Class-aware sampler weights are non-uniform.
+    7. Post-overfit eval predictions actually match GT in the padded frame
+       (>=1 prediction with correct class + IoU>0.5). Catches the class of
+       bug where loss decreases but predictions never land — coord-space
+       mismatch, class-id translation, eval-mode forward divergence.
+    8. Eval forward pass on a val sample produces finite loss.
+    9. Class-aware sampler weights are non-uniform.
 
 @author: Nikhil Bhargava
 @date: 2026-05-08
@@ -112,7 +116,7 @@ def _find_indices_with_annotations(ds, k: int = 2, max_search: int = 100):
 
 # --------- stages ----------
 def stage_build_data():
-    logger.info("[1/8] Building processor + datasets")
+    logger.info("[1/9] Building processor + datasets")
     image_processor, train_ds, val_ds, id2label, label2id = build_processor_and_datasets()
     logger.info(f"  train={len(train_ds)}  val={len(val_ds)}  classes={len(id2label)}")
     _check(len(train_ds) > 0, "train dataset is non-empty")
@@ -122,7 +126,7 @@ def stage_build_data():
 
 
 def stage_build_model(id2label, label2id, device):
-    logger.info(f"[2/8] Building model (RT-DETR + FPN + OV head)")
+    logger.info(f"[2/9] Building model (RT-DETR + FPN + OV head)")
     logger.info(f"  backbone   = {Config.PRETRAINED_BACKBONE}")
     logger.info(f"  text enc.  = {Config.TEXT_ENCODER}")
     logger.info(f"  image size = {Config.IMAGE_SIZE}")
@@ -138,7 +142,7 @@ def stage_build_model(id2label, label2id, device):
 
 
 def stage_check_freeze(model):
-    logger.info("[3/8] Checking backbone freeze")
+    logger.info("[3/9] Checking backbone freeze")
     fpn = _get_fpn(model)
     _check(isinstance(fpn, DinoV3FPNBackbone), "backbone is DinoV3FPNBackbone")
     body_trainable = sum(int(p.requires_grad) for p in fpn.body.parameters())
@@ -152,7 +156,7 @@ def stage_check_freeze(model):
 
 
 def stage_check_fpn_shapes(model, device):
-    logger.info("[4/8] Checking FPN multi-scale output shapes")
+    logger.info("[4/9] Checking FPN multi-scale output shapes")
     fpn = _get_fpn(model)
     fpn.eval()
     # Accept either RT-DETR-style {"height", "width"} or letterbox {"shortest_edge", "longest_edge"}.
@@ -198,7 +202,7 @@ def stage_check_fpn_shapes(model, device):
 
 
 def stage_check_gradient_flow(model, batch):
-    logger.info("[5/8] Single forward + backward — checking gradient flow")
+    logger.info("[5/9] Single forward + backward — checking gradient flow")
     model.train()
     model.zero_grad()
     out = model(**batch)
@@ -228,7 +232,7 @@ def stage_check_gradient_flow(model, batch):
 
 
 def stage_overfit_one_batch(model, batch, steps: int = 300, lr: float = 5e-4):
-    logger.info(f"[6/8] Overfitting on a single batch ({steps} steps, lr={lr})")
+    logger.info(f"[6/9] Overfitting on a single batch ({steps} steps, lr={lr})")
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
     model.train()
@@ -253,8 +257,88 @@ def stage_overfit_one_batch(model, batch, steps: int = 300, lr: float = 5e-4):
                        "or LR may need tuning. Acceptable, but worth noting.")
 
 
+def _box_iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Pairwise IoU between xyxy box sets a:[N,4] and b:[M,4] -> [N,M]."""
+    if a.numel() == 0 or b.numel() == 0:
+        return torch.zeros((a.shape[0], b.shape[0]), device=a.device, dtype=a.dtype)
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    inter = (rb - lt).clamp(min=0).prod(-1)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / union.clamp(min=1e-6)
+
+
+def stage_check_eval_predictions(model, batch, image_processor):
+    """After overfit, the model must (in eval mode) emit at least one prediction
+    that matches a GT box on the same batch: correct class label AND IoU > 0.5
+    in the padded S×S frame.
+
+    Why: the overfit test only proves loss decreases. It does NOT prove the
+    model's eval-time outputs land in the same coordinate system / class index
+    space as the GT. A class-id translation bug, a coord-space mismatch (see
+    CLAUDE.md "Padded-frame coordinate convention"), or any eval-mode forward
+    divergence shows up here as zero matches even though loss looks fine.
+    """
+    logger.info("[7/9] Post-overfit eval predictions vs GT (catches coord/class-id drift)")
+    target_size = Config.IMAGE_SIZE.get(
+        "longest_edge", Config.IMAGE_SIZE.get("height", 640)
+    )
+    device = batch["pixel_values"].device
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**batch)
+
+    B = batch["pixel_values"].shape[0]
+    # post-process in pixel coords of the padded S×S frame (what the model trained on)
+    target_sizes = torch.tensor([[target_size, target_size]] * B,
+                                dtype=torch.long, device=device)
+    res = image_processor.post_process_object_detection(
+        outputs, threshold=0.1, target_sizes=target_sizes,
+    )
+
+    total_gt = 0
+    total_pred = 0
+    matched = 0
+    for i, dets in enumerate(res):
+        gt_cxcywh = batch["labels"][i].get("boxes")
+        gt_classes = batch["labels"][i].get("class_labels")
+        if gt_cxcywh is None or gt_cxcywh.numel() == 0:
+            continue
+        total_gt += gt_cxcywh.shape[0]
+        # GT cxcywh in [0,1] of padded S×S -> xyxy in pixels of S×S
+        gt_xyxy = torch.stack([
+            (gt_cxcywh[:, 0] - gt_cxcywh[:, 2] / 2) * target_size,
+            (gt_cxcywh[:, 1] - gt_cxcywh[:, 3] / 2) * target_size,
+            (gt_cxcywh[:, 0] + gt_cxcywh[:, 2] / 2) * target_size,
+            (gt_cxcywh[:, 1] + gt_cxcywh[:, 3] / 2) * target_size,
+        ], dim=1).to(device)
+
+        pred_boxes = dets["boxes"]
+        pred_classes = dets["labels"]
+        total_pred += pred_boxes.shape[0]
+        if pred_boxes.numel() == 0:
+            continue
+
+        ious = _box_iou_xyxy(pred_boxes, gt_xyxy)
+        for g in range(gt_xyxy.shape[0]):
+            gt_cls = int(gt_classes[g].item())
+            same_cls = (pred_classes == gt_cls)
+            if not bool(same_cls.any().item()):
+                continue
+            if bool((ious[same_cls, g] > 0.5).any().item()):
+                matched += 1
+
+    logger.info(f"  preds@0.1={total_pred}  GT={total_gt}  matched(class+IoU>0.5)={matched}")
+    _check(total_pred > 0, "at least one prediction emitted at threshold 0.1 after overfit")
+    _check(matched > 0,
+           f"≥1 post-overfit prediction matches GT (correct class + IoU>0.5) — "
+           f"if 0, suspect coord-space/class-id desync or EMA-at-eval bug")
+
+
 def stage_eval_pass(model, val_ds, device):
-    logger.info("[7/8] Eval forward pass")
+    logger.info("[8/9] Eval forward pass")
     model.eval()
     idx = _find_indices_with_annotations(val_ds, k=1)[0]
     batch = collate_fn([val_ds[idx]])
@@ -266,7 +350,7 @@ def stage_eval_pass(model, val_ds, device):
 
 def stage_check_sampler(train_ds):
     sampler_kind = os.getenv("RAPTOR_SAMPLER_KIND", "rfs").lower()
-    logger.info(f"[8/8] Checking class-aware sampler weights (kind={sampler_kind})")
+    logger.info(f"[9/9] Checking class-aware sampler weights (kind={sampler_kind})")
     train_json = Path(os.path.join(BASE_PATH, str(Config.TRAIN_JSON)))
     if sampler_kind == "rfs":
         img_w = compute_rfs_image_weights_from_json(
@@ -301,6 +385,7 @@ def run_smoke_test():
 
     stage_check_gradient_flow(model, batch)
     stage_overfit_one_batch(model, batch, steps=300, lr=5e-4)
+    stage_check_eval_predictions(model, batch, image_processor)
     stage_eval_pass(model, val_ds, device)
     stage_check_sampler(train_ds)
 
